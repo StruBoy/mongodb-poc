@@ -6,7 +6,7 @@ Five customer-segment proofs-of-concept built on MongoDB Atlas. Each one demonst
 |---|---|---|---|
 | 1 | [Fraud Detection](./plans/01_FinServ_Fraud_Detection.md) (FinServ) | **Implemented** in [`fraud-detect/`](./fraud-detect) | Vector similarity for live anomaly scoring |
 | 2 | [Hybrid Search](./plans/02_DigitalNative_Hybrid_Search.md) (Digital-native) | **Implemented** in [`hybrid-search/`](./hybrid-search) | Atlas Search + Vector Search + `$rankFusion` |
-| 3 | [RAG Knowledge Base](./plans/03_AI_RAG_Knowledge_Base.md) (AI-native) | Not started | Self-updating retrieval with no sync pipeline |
+| 3 | [RAG Knowledge Base](./plans/03_AI_RAG_Knowledge_Base.md) (AI-native) | **Implemented** in [`ai-kb/`](./ai-kb) | Self-updating retrieval with no sync pipeline |
 | 4 | [Citizen Case Mgmt](./plans/04_GovTech_Case_Management.md) (GovTech) | Not started | Polymorphic docs + field-level encryption |
 | 5 | [IoT Telemetry](./plans/05_Telco_IoT_Telemetry.md) (Telco) | Not started | Time-series collections + real-time aggregations |
 
@@ -223,6 +223,101 @@ Caveats worth acknowledging if asked:
 - The PoC ships **3** archetypes (`card_testing`, `foreign_cnp`, `account_takeover`) — the two from the playbook that only differed from normal transactions on the amount axis (`amount_anomaly`, `merchant_category_fraud`) were dropped because voyage-3 cosine doesn't cleanly separate amount-only signals.
 - About 3% of normal transactions occasionally cross threshold — visible as the rare red row even with no inject. That's the calibrated tail trade-off; raising the threshold reduces false positives but also reduces archetype sensitivity.
 
+## Deploy the RAG Knowledge Base PoC
+
+Total spin-up time on a clean machine: ~10 min, plus ~2 min for corpus generation.
+
+### 1. Provision the Atlas cluster
+
+In the Atlas console:
+
+1. Create project `poc-rag-knowledge` (or reuse an existing PoC project — each PoC uses its own database, so they coexist on one cluster)
+2. Build cluster: **M10**, any MongoDB 8.x
+3. **Database Access** → add user `pocuser` with `readWriteAnyDatabase`
+4. **Network Access** → add your current IP (or `0.0.0.0/0` for the demo only — revoke after)
+5. **Connect → Drivers** → copy the SRV connection string
+
+### 2. Configure local environment
+
+```bash
+cd ai-kb
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+cp .env.example .env
+# Edit .env and set:
+#   MONGODB_URI=<paste from Atlas Connect, with your password substituted>
+#   VOYAGE_API_KEY=<from voyageai.com — payment method must be on file>
+#   ANTHROPIC_API_KEY=<from console.anthropic.com>
+```
+
+### 3. Verify connectivity
+
+```bash
+python -m scripts.check_env
+```
+
+Six checks: env vars, MongoDB connection, `kb_demo` db / collection, Voyage authentication, Voyage rate-limit (confirms a payment method is configured), and Anthropic authentication. All six should report `[OK]` before proceeding.
+
+### 4. Create the database, collection, and vector index
+
+```bash
+python -m scripts.create_db_index
+```
+
+Idempotent. Creates `kb_demo.documents` and the 1024-dim cosine vector index `kb_vector_idx` (with `category` as a filter field), then polls until queryable.
+
+### 5. Generate the corpus
+
+```bash
+python -m data.generate
+```
+
+Generates 20 enterprise policy documents across 5 categories (HR, IT, Finance, Product, Security), expands each via Claude into a 150–200-word body, and embeds with `voyage-3` on every write through `upsert_document` — the same code path the editor UI uses. Takes ~2 minutes; cost is well under USD 0.10.
+
+### 6. Verify the corpus loaded correctly
+
+```bash
+python -m scripts.verify_corpus
+```
+
+Confirms count (20), required fields, embedding dimensionality (1024), category coverage, `_id` format, and body length. Exits non-zero on any structural failure.
+
+### 7. Smoke-test the RAG pipeline
+
+```bash
+python -m scripts.smoke_test
+```
+
+Runs three representative questions ("parental leave", "remote work", "phishing reporting") through `answer_question` and confirms the expected source document is the top hit with non-empty answer text and per-call retrieval/generation timings.
+
+### 8. Launch the demo UI
+
+```bash
+streamlit run app.py
+```
+
+Split-pane layout at `http://localhost:8501`:
+- **Left** — chat with the knowledge base, sources expandable per turn (similarity score, category, retrieval/generation latency)
+- **Right** — document editor for any policy; saving re-embeds via `voyage-3` on the same upsert path
+- **Sidebar** — five pre-baked demo prompts that exercise every category
+
+### Demo flow
+
+The story: source-of-truth document edits propagate to the AI answer with no sync pipeline. Operational store and vector store are the same store.
+
+1. **Set up the universal RAG problem (1 min).** "Every team building production RAG hits the same wall — source documents update and the embeddings in your vector store go stale. The standard fix is a CDC pipeline, a re-embedding job, and drift monitoring. That's the integration tax in one sentence."
+2. **Show the architecture (1 min).** "One MongoDB cluster. Documents and their embeddings live in the same collection. When a document is written, its embedding regenerates as part of the same operation. There is no separate vector store."
+3. **Run the demo question (30 sec).** Click the **"How much parental leave do we offer?"** sidebar prompt. The answer cites `hr-001` and mentions twelve weeks of paid leave.
+4. **The live-edit moment (2 min).** Switch to the editor pane on the right (defaulted to `hr-001`). In the body, change "twelve weeks" to "16 weeks". Click **💾 Save & re-embed**. The success banner confirms the embedding was just regenerated. Click the parental-leave prompt again — the new answer says 16 weeks.
+5. **Land the architectural point (30 sec).** "There is nothing to synchronize because there is nothing separate. That's the platform consolidation argument in one demo."
+
+Architectural points to land:
+- One cluster, one query language, no sync pipelines.
+- The same `documents` collection holds the source-of-truth body *and* the 1024-dim embedding — `$vectorSearch` reads them together.
+- Auto-embedding on write is application-side here for clarity; Atlas Vector Search now also supports native auto-embedding via Voyage AI in preview if you'd rather have the database manage the lifecycle directly.
+
 ## Project layout
 
 ```
@@ -243,7 +338,13 @@ mongodb_poc/
 │   ├── src/               ← importable modules: db, embed, core
 │   ├── scripts/           ← CLI utilities run via `python -m scripts.<name>`
 │   └── data/              ← generate.py
-├── ai-kb/                 ← placeholder for PoC #3
+├── ai-kb/                 ← implemented PoC #3
+│   ├── app.py             ← Streamlit chat + editor (split-pane)
+│   ├── requirements.txt
+│   ├── .env.example
+│   ├── src/               ← db, embed, docs (auto-embed on upsert), rag
+│   ├── scripts/           ← check_env, create_db_index, verify_corpus, smoke_test
+│   └── data/              ← generate.py
 ├── govtech-casemgmt/      ← placeholder for PoC #4
 └── iot-telemetry/         ← placeholder for PoC #5
 ```
