@@ -8,16 +8,17 @@ Five customer-segment proofs-of-concept built on MongoDB Atlas. Each one demonst
 | 2 | [Hybrid Search](./plans/02_DigitalNative_Hybrid_Search.md) (Digital-native) | **Implemented** in [`hybrid-search/`](./hybrid-search) | Atlas Search + Vector Search + `$rankFusion` |
 | 3 | [RAG Knowledge Base](./plans/03_AI_RAG_Knowledge_Base.md) (AI-native) | **Implemented** in [`ai-kb/`](./ai-kb) | Self-updating retrieval with no sync pipeline |
 | 4 | [Citizen Case Mgmt](./plans/04_GovTech_Case_Management.md) (GovTech) | Not started | Polymorphic docs + field-level encryption |
-| 5 | [IoT Telemetry](./plans/05_Telco_IoT_Telemetry.md) (Telco) | Not started | Time-series collections + real-time aggregations |
+| 5 | [IoT Telemetry](./plans/05_Telco_IoT_Telemetry.md) (Telco) | **Implemented** in [`iot-telemetry/`](./iot-telemetry) | Time-series collections + real-time aggregations |
 
 ## Prerequisites
 
-- MongoDB Atlas cluster (M10 recommended; **8.1+** required for hybrid-search's `$rankFusion`, any 8.x is fine for fraud-detect)
+- MongoDB Atlas cluster (M10 recommended; **8.1+** required for hybrid-search's `$rankFusion`, any 8.x is fine for the others)
 - `pocuser` account with `readWriteAnyDatabase` role
 - Atlas connection string in each PoC's `.env`, see `.env.example`
-- Voyage AI account with payment method on file (both PoCs use `voyage-3` embeddings)
-- Anthropic API key (hybrid-search only — used to synthesize product descriptions)
+- Voyage AI account with payment method on file (PoCs 1, 2, 3 — `voyage-3` embeddings)
+- Anthropic API key (PoCs 2, 3 — Claude haiku 4.5 for description synthesis and RAG generation)
 - Python 3.11+
+- IoT telemetry PoC (5) needs neither Voyage nor Anthropic — pure time-series + aggregations
 
 Each PoC lives in its own directory with its own venv, `.env`, and Atlas project. They can be deployed independently.
 
@@ -318,6 +319,118 @@ Architectural points to land:
 - The same `documents` collection holds the source-of-truth body *and* the 1024-dim embedding — `$vectorSearch` reads them together.
 - Auto-embedding on write is application-side here for clarity; Atlas Vector Search now also supports native auto-embedding via Voyage AI in preview if you'd rather have the database manage the lifecycle directly.
 
+## Deploy the IoT Telemetry PoC
+
+Total spin-up time on a clean machine: ~10 min, plus ~5 sec for fleet generation. No Voyage / Anthropic keys required — this PoC is pure time-series + aggregations.
+
+### 1. Provision the Atlas cluster
+
+In the Atlas console:
+
+1. Create project `poc-telco-telemetry` (or reuse an existing PoC project — each PoC uses its own database, so they coexist on one cluster)
+2. Build cluster: **M10**, any MongoDB 8.x (the cluster region in `ap-southeast-1` matches the simulated fleet, but isn't required)
+3. **Database Access** → add user `pocuser` with `readWriteAnyDatabase`
+4. **Network Access** → add your current IP (or `0.0.0.0/0` for the demo only — revoke after)
+5. **Connect → Drivers** → copy the SRV connection string
+
+### 2. Configure local environment
+
+```bash
+cd iot-telemetry
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+cp .env.example .env
+# Edit .env and set:
+#   MONGODB_URI=<paste from Atlas Connect, with your password substituted>
+```
+
+### 3. Verify connectivity
+
+```bash
+python -m scripts.check_env
+```
+
+Three checks: env vars, MongoDB ping, and `telco_demo` database / collection reachability. Collections are reported as `[info] not yet created` on first run — that's expected.
+
+### 4. Create the database, time-series collection, and indexes
+
+```bash
+python -m scripts.create_db_index
+```
+
+Idempotent. Creates `telco_demo.telemetry` as a time-series collection (`timeField=ts`, `metaField=meta`, `granularity=seconds`, `expireAfterSeconds=86400`), the regular `towers` and `control_failures` collections, and two compound indexes on `telemetry` (`{meta.tower_id, ts}` and `{meta.region, ts}`).
+
+Time-series collections cannot have their options modified after creation; on re-run the script detects the existing collection and either skips (if options match) or fails loudly (if drift). Drop manually and re-run if you really mean to recreate.
+
+### 5. Generate the tower fleet
+
+```bash
+python -m data.generate_fleet
+```
+
+Inserts 1,000 cell towers across three Singapore districts: **Central** (CBD/Marina Bay/Orchard, 350 towers), **East** (Tampines/Changi/Bedok, 300), and **West** (Jurong/Clementi/Bukit Timah, 350). Tower IDs are district-prefixed (`TWR-CEN-0001` … `TWR-WST-0350`) so the audience can read them directly in the dashboard. Takes a few seconds; no API costs.
+
+### 6. Verify the fleet loaded correctly
+
+```bash
+python -m scripts.verify_data
+```
+
+Eight checks: tower count, district distribution, ID prefix matches region, required fields, tower types, time-series collection options, telemetry document shape, and telemetry recency. The last two warn rather than fail if you haven't started the streamer yet.
+
+### 7. Start the telemetry stream (separate terminal)
+
+```bash
+python -m data.stream_telemetry
+```
+
+Async motor-based generator. Pumps ~1,000 events/sec across the fleet (1 event per tower per cycle, with parallel batched `insert_many` in chunks of 500). Each cycle reads `telco_demo.control_failures` to know which towers should emit degraded metrics. Leave running; Ctrl+C stops cleanly.
+
+For higher throughput pass `--rate 2000` etc. — at ~5,000 events/sec on M10 you'll start seeing connection pool pressure; M30 handles 10,000+.
+
+### 8. Smoke-test the end-to-end pipeline
+
+In your original terminal (with the stream still running in the other):
+
+```bash
+python -m scripts.smoke_test
+```
+
+Seven steps: confirms the stream is alive, runs all four analytics queries against live data, injects 3 failures into `West`, waits 8 seconds, confirms those 3 towers cross the 5%-packet-loss threshold, and cleans up the control rows so the dashboard opens green.
+
+### 9. Launch the dashboard
+
+```bash
+streamlit run app.py
+```
+
+At `http://localhost:8501`:
+
+- **Top metrics:** live write rate, towers reporting, district count, active failures
+- **District health (last 30 sec):** one card per Singapore district with avg signal / packet loss / throughput / temperature, red badge above 3% packet loss
+- **Throughput timeline:** per-district stacked-line Plotly chart over the last 2 minutes
+- **Tower fleet map:** all 1,000 towers plotted on a Singapore map, recoloured red as failures are injected
+- **Towers needing attention:** expandable list of towers above the 5% packet-loss threshold
+- **Sidebar:** per-district inject buttons (`Central` / `East` / `West`, 3 towers each), a `🔥 Major incident` button (15 towers in West), `✅ Clear all failures`, and a refresh-interval slider
+
+### Demo flow
+
+The story: one Atlas cluster ingests telemetry at ~1,000 events/sec, stores it in a time-series collection, and runs the dashboard's aggregations directly off the same collection. No streaming tier, no warehouse, no sync layer.
+
+1. **Frame the problem (1 min).** "If you run technology in an APAC telco, network telemetry is your hardest data architecture problem. The standard answer is Kafka feeding a time-series database feeding a warehouse. Three systems minimum, often more, with all the operational overhead and ETL fragility that implies."
+2. **Show the architecture (1 min).** "This is one MongoDB cluster. The `telemetry` collection is a time-series collection — purpose-built for this shape of data. The same cluster ingests, stores, queries, and feeds the dashboard you're looking at."
+3. **Steady state (30 sec).** Point at the live write-rate counter (~1,000 ops/sec). All three districts green, throughput chart steady, the tower map is a sea of green dots over Singapore.
+4. **Inject the failure (1.5 min).** Click `West` in the sidebar. Within ~5 seconds three towers in Jurong/Clementi/Bukit Timah turn red on the map, the West throughput line dips, the West district card flips to red, and three towers appear in the "needs attention" list with their specific signal / packet-loss / temperature numbers.
+5. **Major incident (optional).** Click `🔥 Major incident: 15 towers in West`. The dashboard fills with red — same query path, just more rows back from the same `$group` aggregation.
+6. **Land the architectural point (30 sec).** "Every system you remove from the architecture is one fewer point of failure during a major incident — and major incidents are when you find out which architectural shortcuts you took five years ago."
+
+Architectural points to land:
+- One cluster, time-series + regular collections side by side, native real-time aggregations.
+- Failure-injection state lives in `control_failures` — same database that holds the telemetry. Operational metadata and time-series telemetry coexist in one place.
+- The 24-hour TTL (`expireAfterSeconds: 86400`) is a one-line collection option, not a separate retention service.
+
 ## Project layout
 
 ```
@@ -346,7 +459,13 @@ mongodb_poc/
 │   ├── scripts/           ← check_env, create_db_index, verify_corpus, smoke_test
 │   └── data/              ← generate.py
 ├── govtech-casemgmt/      ← placeholder for PoC #4
-└── iot-telemetry/         ← placeholder for PoC #5
+└── iot-telemetry/         ← implemented PoC #5
+    ├── app.py             ← Streamlit operations dashboard
+    ├── requirements.txt
+    ├── .env.example
+    ├── src/               ← db (sync + async), analytics
+    ├── scripts/           ← check_env, create_db_index, verify_data, smoke_test
+    └── data/              ← generate_fleet.py, stream_telemetry.py
 ```
 
 ## Cleanup
