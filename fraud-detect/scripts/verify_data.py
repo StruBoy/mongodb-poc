@@ -11,13 +11,12 @@ from collections import Counter
 
 from src.db import get_db
 
-EXPECTED_FRAUD_COUNT = 2000
+EXPECTED_FRAUD_COUNT = 1200
 EXPECTED_NORMAL_COUNT = 100000
 COUNT_TOLERANCE = 0.05
 
 EXPECTED_ARCHETYPES = {
     "card_testing", "foreign_cnp", "account_takeover",
-    "amount_anomaly", "merchant_category_fraud",
 }
 EXPECTED_PER_ARCHETYPE = 400
 

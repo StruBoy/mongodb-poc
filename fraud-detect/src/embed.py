@@ -58,17 +58,18 @@ def _channel_phrase(channel: str, card_present: bool) -> str:
 
 
 def transaction_to_text(tx: dict) -> str:
-    """Render a transaction as a tag-style risk description.
+    """Render a transaction as a tag-style risk description with raw values.
 
-    Each tag is a discriminative phrase. We deliberately drop boilerplate so the
-    embedding direction is dominated by risk-relevant tokens (amount bin, channel,
-    country, distance, hour) rather than shared sentence structure.
+    Each tag combines a discriminative bin label with the raw numeric value. The
+    bin gives voyage-3 a semantic anchor; the raw value makes each example
+    slightly unique so two transactions with similar features but different
+    magnitudes don't collapse to identical embeddings.
     """
     parts = [
-        _amount_phrase(tx["amount"]),
+        f"{_amount_phrase(tx['amount'])} of {tx['amount']:.0f} dollars",
         _channel_phrase(tx["channel"], tx["card_present"]),
         _country_phrase(tx["country"]),
-        _distance_phrase(tx["distance_from_home_km"]),
-        _hour_phrase(tx["hour_of_day"]),
+        f"{_distance_phrase(tx['distance_from_home_km'])} {tx['distance_from_home_km']:.0f} km",
+        f"{_hour_phrase(tx['hour_of_day'])} at {tx['hour_of_day']:02d}:00",
     ]
     return ". ".join(parts) + "."

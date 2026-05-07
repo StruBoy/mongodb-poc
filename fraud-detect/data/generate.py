@@ -49,20 +49,6 @@ FRAUD_ARCHETYPES = {
         "card_present": False,
         "examples": 400,
     },
-    "amount_anomaly": {
-        "description": "Single transaction far exceeding typical spending pattern",
-        "amount_range": (2000, 8000),
-        "channel": "in_person",
-        "card_present": True,
-        "examples": 400,
-    },
-    "merchant_category_fraud": {
-        "description": "Transaction at high-risk merchant category at unusual time",
-        "amount_range": (200, 1500),
-        "channel": "online",
-        "card_present": False,
-        "examples": 400,
-    },
 }
 
 

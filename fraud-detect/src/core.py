@@ -16,9 +16,8 @@ from src.embed import embed_texts, transaction_to_text
 
 ARCHETYPES = [
     "card_testing", "foreign_cnp", "account_takeover",
-    "amount_anomaly", "merchant_category_fraud",
 ]
-ANOMALY_THRESHOLD = 0.86   # calibrated empirically — see scripts/calibrate.py
+ANOMALY_THRESHOLD = 0.865  # calibrated empirically — see scripts/calibrate.py
 NUM_CANDIDATES = 500       # > per-archetype corpus size so pre-filter sees all of it
 
 

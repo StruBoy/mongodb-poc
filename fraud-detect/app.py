@@ -13,7 +13,7 @@ from datetime import datetime
 import streamlit as st
 
 from data.generate import FRAUD_ARCHETYPES, generate_fraud_example, generate_normal_transaction
-from src.core import ANOMALY_THRESHOLD, ARCHETYPES, score_transaction
+from src.core import ANOMALY_THRESHOLD, score_transaction
 from src.embed import transaction_to_text
 
 st.set_page_config(page_title="Fraud Detection Demo", layout="wide")

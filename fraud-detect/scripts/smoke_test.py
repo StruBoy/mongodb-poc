@@ -19,7 +19,7 @@ from src.core import ANOMALY_THRESHOLD, score_transaction
 SUSPICIOUS_FOREIGN = {
     "tx_id": "smoke-suspicious-001",
     "ts": datetime.now(),
-    "amount": 1250.00,
+    "amount": 425.00,  # in-range for foreign_cnp archetype ($100-$800)
     "currency": "AUD",
     "merchant_name": "QuickCash Online",
     "merchant_category": "online_retail",

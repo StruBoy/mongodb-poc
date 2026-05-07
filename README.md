@@ -4,23 +4,26 @@ Five customer-segment proofs-of-concept built on MongoDB Atlas. Each one demonst
 
 | # | PoC | Status | Demonstrates |
 |---|---|---|---|
-| 1 | [Fraud Detection](./plans/01_FinServ_Fraud_Detection.md) (FinServ) | Not started | Vector similarity for live anomaly scoring |
+| 1 | [Fraud Detection](./plans/01_FinServ_Fraud_Detection.md) (FinServ) | **Implemented** in [`fraud-detect/`](./fraud-detect) | Vector similarity for live anomaly scoring |
 | 2 | [Hybrid Search](./plans/02_DigitalNative_Hybrid_Search.md) (Digital-native) | **Implemented** in [`hybrid-search/`](./hybrid-search) | Atlas Search + Vector Search + `$rankFusion` |
 | 3 | [RAG Knowledge Base](./plans/03_AI_RAG_Knowledge_Base.md) (AI-native) | Not started | Self-updating retrieval with no sync pipeline |
 | 4 | [Citizen Case Mgmt](./plans/04_GovTech_Case_Management.md) (GovTech) | Not started | Polymorphic docs + field-level encryption |
 | 5 | [IoT Telemetry](./plans/05_Telco_IoT_Telemetry.md) (Telco) | Not started | Time-series collections + real-time aggregations |
 
 ## Prerequisites
-- MongoDB Atlas Cluster M10 (8.1+ for `$rankFusion`)
+
+- MongoDB Atlas cluster (M10 recommended; **8.1+** required for hybrid-search's `$rankFusion`, any 8.x is fine for fraud-detect)
 - `pocuser` account with `readWriteAnyDatabase` role
-- Atlas connection string in `.env`, see `.env.example`
-- Voyage AI account with payment method configured
-- Anthropic API key
+- Atlas connection string in each PoC's `.env`, see `.env.example`
+- Voyage AI account with payment method on file (both PoCs use `voyage-3` embeddings)
+- Anthropic API key (hybrid-search only — used to synthesize product descriptions)
 - Python 3.11+
+
+Each PoC lives in its own directory with its own venv, `.env`, and Atlas project. They can be deployed independently.
 
 ## Deploy the Hybrid Search PoC
 
-The only PoC currently implemented end-to-end. Total spin-up time on a clean machine: ~15 min, plus ~10 min for catalog generation.
+Total spin-up time on a clean machine: ~15 min, plus ~10 min for catalog generation.
 
 ### 1. Provision the Atlas cluster
 
@@ -100,12 +103,139 @@ Two tabs at `http://localhost:8501`:
 
 The sidebar offers three pre-baked demo queries that highlight when each mode wins.
 
+### Demo flow
+
+The story: one Atlas cluster, three retrieval modes, and `$rankFusion` merging them in a native aggregation stage — no separate vector DB, no embedding pipeline, no sync layer.
+
+1. **Marathon training** sidebar query — all three modes return relevant footwear, but the hybrid panel ranks the marathon-relevant products first by combining brand-matched and intent-matched signals.
+2. **Brand search** ("TrailMaster") — keyword nails the brand directly; semantic drifts toward thematically similar but unbranded items. Hybrid prioritizes the exact-brand hits.
+3. **Long flights** ("comfortable for long flights") — semantic understands intent and surfaces noise-cancelling headphones; keyword has nothing useful to match against. Hybrid passes the semantic ranking through.
+4. Switch to the **📋 Full catalog** tab to show the same documents are available for operational queries — same cluster, same collection.
+
+Architectural points to land:
+- One cluster, one query language, no sync pipelines.
+- `$rankFusion` is a native aggregation stage (MongoDB 8.1+) — reciprocal-rank-fusion without client-side glue.
+- The same `products` collection powers keyword, semantic, and hybrid retrieval simultaneously.
+
+## Deploy the Fraud Detection PoC
+
+Total spin-up time on a clean machine: ~10 min, plus ~1 min for corpus generation.
+
+### 1. Provision the Atlas cluster
+
+In the Atlas console:
+
+1. Create project `poc-fraud-detection`
+2. Build cluster: **M10**, any MongoDB 8.x
+3. **Database Access** → add user `pocuser` with `readWriteAnyDatabase`
+4. **Network Access** → add your current IP (or `0.0.0.0/0` for the demo only — revoke after)
+5. **Connect → Drivers** → copy the SRV connection string
+
+### 2. Configure local environment
+
+```bash
+cd fraud-detect
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+cp .env.example .env
+# Edit .env and set:
+#   MONGODB_URI=<paste from Atlas Connect, with your password substituted>
+#   VOYAGE_API_KEY=<from voyageai.com — payment method must be on file>
+```
+
+No Anthropic key required — fraud examples are synthesized with `faker`, not Claude.
+
+### 3. Verify connectivity
+
+```bash
+python -m scripts.check_env
+```
+
+Five checks: env vars, MongoDB connection, `fraud_demo` db / collections, Voyage authentication, Voyage billing probe. All five must report `[OK]`.
+
+### 4. Create the database, collections, and vector index
+
+```bash
+python -m scripts.create_db_index
+```
+
+Idempotent. Creates `fraud_demo.fraud_examples` and `fraud_demo.transactions`, plus the 1024-dim cosine vector index `fraud_vector_idx` (with `archetype` as a filter field), and polls until queryable.
+
+### 5. Generate the corpus
+
+```bash
+python -m data.generate
+```
+
+Generates 1,200 labeled fraud examples (3 archetypes × 400) and 100,000 normal transactions. Embeds the fraud corpus with `voyage-3` (1024-dim) in batches of 50. Takes ~1 minute. Cost is well under Voyage's free 200M-token allowance.
+
+### 6. Verify the data loaded correctly
+
+```bash
+python -m scripts.verify_data
+```
+
+Confirms counts (~1,200 fraud / ~100,000 normal), required fields, embedding shape, per-archetype distribution, and label sanity. Exits non-zero on any structural failure.
+
+### 7. Smoke-test the scorer
+
+```bash
+python -m scripts.smoke_test
+```
+
+Runs three hand-crafted transactions through `score_transaction`: a foreign card-not-present transaction, a benign local groceries purchase, and an off-hours large online purchase. All three should classify correctly under the calibrated threshold.
+
+### 8. (Optional) Calibrate the threshold
+
+```bash
+python -m scripts.calibrate
+```
+
+Samples 100 random normal transactions plus 20 of each fraud archetype, reports false-positive rate by threshold and per-archetype true-positive rate. Use the output to tune `ANOMALY_THRESHOLD` in `src/core.py` (currently `0.865`, giving ~3% FPR on normals and 75–95% TPR per archetype).
+
+### 9. Launch the demo dashboard
+
+```bash
+streamlit run app.py
+```
+
+At `http://localhost:8501`:
+- **Sidebar** — fraud archetype selector, 💉 Inject button, auto-stream toggle, stream-interval slider, reset, and live session stats.
+- **Live transaction feed** — every scored transaction with red/green badge, top archetype, score, gap over runner-up, and end-to-end latency.
+- **Anomaly alerts** — expand any alert to see the best match within each archetype, the score margin, the exact text that was embedded for the query, and per-alert latency.
+
+### Demo flow
+
+The story: each incoming transaction is scored against a corpus of known fraud patterns using vector similarity. The matched archetype and the margin over the runner-up explain *why* — no rules engine, alert latency under ~250 ms end to end.
+
+1. **Set the scene (30 sec).** Auto-stream is on by default — normal transactions flow in every 2 seconds, mostly green. Each one is being scored against 1,200 labeled fraud examples via per-archetype filtered `$vectorSearch` in real time.
+2. **Inject the demo fraud (30 sec).** With `foreign_cnp` selected, click 💉. Within ~250 ms a red row appears in the feed: risk ~0.88, top archetype `foreign_cnp`, margin around +0.06 over the next-best archetype. A new alert lands in the right pane.
+3. **Show explainability (1 min).** Expand the alert:
+   - Top-1 match within each of the three archetypes, sorted — `foreign_cnp` clearly wins, runners-up trail by a clean margin
+   - Risk score, margin over runner-up, and per-transaction latency
+   - The exact tag-style text used to embed the query (popover at the bottom of the alert)
+4. **Try the other archetypes.** Switch to `card_testing` or `account_takeover` and inject — each one flags with its own archetype correctly identified.
+5. **Land the architectural point (30 sec).** All of this is one Atlas cluster: operational `transactions`, labeled `fraud_examples`, and 1024-dim embeddings live together. No separate vector DB, no rules engine, no sync layer.
+
+Caveats worth acknowledging if asked:
+- The PoC ships **3** archetypes (`card_testing`, `foreign_cnp`, `account_takeover`) — the two from the playbook that only differed from normal transactions on the amount axis (`amount_anomaly`, `merchant_category_fraud`) were dropped because voyage-3 cosine doesn't cleanly separate amount-only signals.
+- About 3% of normal transactions occasionally cross threshold — visible as the rare red row even with no inject. That's the calibrated tail trade-off; raising the threshold reduces false positives but also reduces archetype sensitivity.
+
 ## Project layout
 
 ```
 mongodb_poc/
 ├── README.md              ← this file
 ├── plans/                 ← playbook docs for all five PoCs
+├── fraud-detect/          ← implemented PoC #1
+│   ├── app.py             ← Streamlit dashboard
+│   ├── requirements.txt
+│   ├── .env.example
+│   ├── src/               ← db, embed, core (per-archetype filtered $vectorSearch)
+│   ├── scripts/           ← check_env, create_db_index, verify_data, smoke_test, calibrate, probe
+│   └── data/              ← generate.py
 ├── hybrid-search/         ← implemented PoC #2
 │   ├── app.py             ← Streamlit UI
 │   ├── requirements.txt
@@ -113,7 +243,6 @@ mongodb_poc/
 │   ├── src/               ← importable modules: db, embed, core
 │   ├── scripts/           ← CLI utilities run via `python -m scripts.<name>`
 │   └── data/              ← generate.py
-├── fraud-detect/          ← placeholder for PoC #1
 ├── ai-kb/                 ← placeholder for PoC #3
 ├── govtech-casemgmt/      ← placeholder for PoC #4
 └── iot-telemetry/         ← placeholder for PoC #5
@@ -123,9 +252,9 @@ mongodb_poc/
 
 After the demo:
 
-1. Pause or terminate the Atlas cluster
+1. Pause or terminate the Atlas cluster(s) — each PoC has its own project
 2. Revoke the `pocuser` database user
 3. Remove `0.0.0.0/0` from Network Access if you opened it
-4. (Optional) `deactivate` and `rm -rf hybrid-search/venv`
+4. (Optional) `deactivate` and `rm -rf <poc-dir>/venv`
 
 Running an M10 idle costs ~USD 60/month — pause it if you're not actively demoing.
