@@ -2,3 +2,4 @@ secrets
 secrets.txt
 .env 
 .env.local
+__pycache__/

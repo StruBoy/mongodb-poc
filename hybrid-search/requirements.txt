@@ -1,0 +1,8 @@
+pymongo
+voyageai 
+anthropic 
+streamlit 
+python-dotenv 
+pandas
+certifi
+faker
