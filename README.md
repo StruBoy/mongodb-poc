@@ -7,7 +7,7 @@ Five customer-segment proofs-of-concept built on MongoDB Atlas. Each one demonst
 | 1 | [Fraud Detection](./plans/01_FinServ_Fraud_Detection.md) (FinServ) | **Implemented** in [`fraud-detect/`](./fraud-detect) | Vector similarity for live anomaly scoring |
 | 2 | [Hybrid Search](./plans/02_DigitalNative_Hybrid_Search.md) (Digital-native) | **Implemented** in [`hybrid-search/`](./hybrid-search) | Atlas Search + Vector Search + `$rankFusion` |
 | 3 | [RAG Knowledge Base](./plans/03_AI_RAG_Knowledge_Base.md) (AI-native) | **Implemented** in [`ai-kb/`](./ai-kb) | Self-updating retrieval with no sync pipeline |
-| 4 | [Citizen Case Mgmt](./plans/04_GovTech_Case_Management.md) (GovTech) | Not started | Polymorphic docs + field-level encryption |
+| 4 | [Citizen Case Mgmt](./plans/04_GovTech_Case_Management.md) (GovTech) | **Implemented** in [`govtech-casemgmt/`](./govtech-casemgmt) | Polymorphic docs + field-level encryption |
 | 5 | [IoT Telemetry](./plans/05_Telco_IoT_Telemetry.md) (Telco) | **Implemented** in [`iot-telemetry/`](./iot-telemetry) | Time-series collections + real-time aggregations |
 
 ## Prerequisites
@@ -19,6 +19,7 @@ Five customer-segment proofs-of-concept built on MongoDB Atlas. Each one demonst
 - Anthropic API key (PoCs 2, 3 — Claude haiku 4.5 for description synthesis and RAG generation)
 - Python 3.11+
 - IoT telemetry PoC (5) needs neither Voyage nor Anthropic — pure time-series + aggregations
+- GovTech case management PoC (4) needs neither Voyage nor Anthropic either — it uses application-side AES-256-GCM for field-level encryption (an extra `ENCRYPTION_KEY` env var, generated locally)
 
 Each PoC lives in its own directory with its own venv, `.env`, and Atlas project. They can be deployed independently.
 
@@ -431,6 +432,110 @@ Architectural points to land:
 - Failure-injection state lives in `control_failures` — same database that holds the telemetry. Operational metadata and time-series telemetry coexist in one place.
 - The 24-hour TTL (`expireAfterSeconds: 86400`) is a one-line collection option, not a separate retention service.
 
+## Deploy the GovTech Case Management PoC
+
+Total spin-up time on a clean machine: ~10 min, plus ~20 sec for data generation. No Voyage / Anthropic keys required — the encryption is application-side AES-256-GCM.
+
+### 1. Provision the Atlas cluster
+
+In the Atlas console:
+
+1. Create project `poc-citizen-services` (or reuse an existing PoC project — each PoC uses its own database, so they coexist on one cluster)
+2. Build cluster: **M0 (free) is sufficient**, any MongoDB 8.x. M10 also works if you're sharing the cluster with other PoCs.
+3. **Database Access** → add user `pocuser` with `readWriteAnyDatabase`
+4. **Network Access** → add your current IP (or `0.0.0.0/0` for the demo only — revoke after)
+5. **Connect → Drivers** → copy the SRV connection string
+
+### 2. Configure local environment
+
+```bash
+cd govtech-casemgmt
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+cp .env.example .env
+# Edit .env and set:
+#   MONGODB_URI=<paste from Atlas Connect, with your password substituted>
+#   ENCRYPTION_KEY=<generate via the command in .env.example>
+```
+
+Generate a fresh AES-256 key:
+
+```bash
+python -c "import os, base64; print(base64.b64encode(os.urandom(32)).decode())"
+```
+
+### 3. Verify connectivity
+
+```bash
+python -m scripts.check_env
+```
+
+Four checks: env vars, MongoDB ping, `citizen_demo` db / collection presence, and an AES-256-GCM round-trip using the key in `.env`. Collections show as `[info] not yet created` on first run — that's expected.
+
+### 4. Create the database, collections, and Atlas Search index
+
+```bash
+python -m scripts.create_db_index
+```
+
+Idempotent. Performs plan sections 1.3 (`citizen_demo.cases`, `citizen_demo.citizens`) and 1.4 (the `cases_search_idx` Atlas Search index — **dynamic mapping**, which is the technical detail behind the polymorphism story), then polls until the index reports `queryable: true`.
+
+### 5. Generate the dataset
+
+```bash
+python -m data.generate
+```
+
+Generates 5,000 citizens and 20,000 cases distributed across 5 wildly different schemas: business_permit, building_permit, complaint, benefit_application, marriage_registration. The first citizen in the generated set is the **demo citizen** — the script plants one of every case type for them so the citizen-view timeline lights up all five emojis. PII fields (`national_id`, `dob`, `tax_file_number`, `partner_national_id`) are encrypted before insert via AES-256-GCM with per-record nonces. Takes ~20 seconds.
+
+The script prints the demo citizen's name and `_id` at the end — the Streamlit UI auto-detects them so you don't need to remember.
+
+### 6. Verify the data loaded correctly
+
+```bash
+python -m scripts.verify_data
+```
+
+Eight checks: citizen count (~5,000), case count (~20,000), all 5 case types present and balanced, required fields per schema, citizen PII envelopes round-trip, benefit `tax_file_number` envelopes round-trip, sampled `citizen_id` references resolve, Atlas Search index queryable. Exits non-zero on any structural failure.
+
+### 7. Smoke-test the end-to-end pipeline
+
+```bash
+python -m scripts.smoke_test
+```
+
+Five steps: confirms the demo citizen has all 5 case types in one timeline query; runs cross-case Atlas Search for `noise` (should return complaints) and `cafe` (should return business_permits); inserts a brand-new `ev_charging_station_permit` case type via `add_new_case_type`; confirms it becomes searchable through the dynamic search index within ~2 seconds. Cleans up the demo insert.
+
+### 8. Launch the demo UI
+
+```bash
+streamlit run app.py
+```
+
+Three views, switched from the sidebar at `http://localhost:8501`:
+
+- **Citizen** — pick a citizen; see their full case history as a timeline. The demo citizen at the top of the dropdown has all five case types planted. The citizen record up top is decrypted on read.
+- **Government Officer** — five live metric tiles (one per case type), cross-case search box (`noise`, `cafe`, `extension`, `disability`, `Sydney`), and the **Add a new case type** form pre-loaded with an EV charging station permit example.
+- **Encryption Inspector** — raw documents pulled straight from MongoDB without going through `decrypt_pii`. Shows the `_encrypted` envelopes (base64 ciphertext + per-record nonce) for `national_id`, `dob`, `tax_file_number`, and `partner_national_id`.
+
+### Demo flow
+
+The story: every other government IT environment has citizen data fragmented across one system per service. Here, every case type lives in one MongoDB collection, queryable together — and adding a new service is an `insertOne`, not a project plan.
+
+1. **Frame the structural problem (1 min).** "In every government environment we walk into, citizen data lives across dozens of systems — one for permits, one for benefits, one for complaints. Each has its own database, its own schema, its own deployment cycle. When a citizen calls and asks 'what's the status of all my interactions with the council', there is no answer because there is no unified view."
+2. **The citizen view (2 min).** Switch to **Citizen** mode. The demo citizen is at the top of the dropdown. "This is one MongoDB collection. Five completely different case types — a marriage registration, a business permit, a noise complaint, a disability benefit, a building permit — each with a totally different shape. The marriage record has a celebrant ID. The benefit application has household income. The complaint has a severity field. They all live together. They are all queryable together."
+3. **The officer search (1 min).** Switch to **Government Officer** mode. "Search 'noise' — we get complaints. Search 'cafe' — we get business permits. Search 'extension' — we get building permits. One search index, every case type. The dynamic mapping indexes every field that appears in any document, regardless of which schema it came from."
+4. **The migration moment (1 min).** Scroll down to the **Add a new case type** form. "The city council just announced a new permit category — EV charging stations. In every other system you've worked with, this would be a project. Schema change, migration window, regression testing, deployment. Here it's this." Click **Insert new case type**. "It's there. It's searchable. The citizen view will display it correctly. Nothing was migrated."
+5. **The encryption point (30 sec).** Switch to **Encryption Inspector** mode. "And before anyone in your security team asks: this is what the data actually looks like in MongoDB. National IDs, dates of birth, and tax file numbers are encrypted at the field level. Only authorized application code holding the key can decrypt them. The auditor's first question — how is sensitive PII protected — has a clear answer. In production, MongoDB Queryable Encryption pushes this down into the database itself; the architectural pattern is the same."
+6. **Land the architectural point (30 sec).** "This isn't about MongoDB being clever. It's about the document model removing a constraint that forces every other system to fragment citizen data across silos. When the schema can vary per record, you stop needing a separate system per service."
+
+Architectural points to land:
+- One cluster, one collection, one query language — five completely different case-type schemas inside it.
+- `dynamic: true` on the Atlas Search index turns the polymorphism advantage into a unified search story without per-type mappings.
+- Field-level encryption for PII is application-side AES-256-GCM here for clarity; in production, MongoDB Queryable Encryption pushes the same pattern into the database itself with key-vault-managed keys and equality / range query support against ciphertext.
+
 ## Project layout
 
 ```
@@ -458,7 +563,13 @@ mongodb_poc/
 │   ├── src/               ← db, embed, docs (auto-embed on upsert), rag
 │   ├── scripts/           ← check_env, create_db_index, verify_corpus, smoke_test
 │   └── data/              ← generate.py
-├── govtech-casemgmt/      ← placeholder for PoC #4
+├── govtech-casemgmt/      ← implemented PoC #4
+│   ├── app.py             ← Streamlit (Citizen / Officer / Inspector views)
+│   ├── requirements.txt
+│   ├── .env.example
+│   ├── src/               ← db, crypto (AES-256-GCM), services (Atlas Search + add-new-type)
+│   ├── scripts/           ← check_env, create_db_index, verify_data, smoke_test
+│   └── data/              ← generate.py
 └── iot-telemetry/         ← implemented PoC #5
     ├── app.py             ← Streamlit operations dashboard
     ├── requirements.txt

@@ -1,0 +1,7 @@
+pymongo
+cryptography
+faker
+streamlit
+pandas
+python-dotenv
+certifi
