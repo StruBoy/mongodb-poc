@@ -18,9 +18,21 @@ EXPECTED_EMBEDDING_DIM = 1024
 REQUIRED_FIELDS = {
     "title", "description", "brand", "category",
     "price", "rating", "review_count", "embedding",
+    "_product_type",
 }
 SHORT_DESCRIPTION_THRESHOLD_CHARS = 80
 FALLBACK_RATIO_THRESHOLD = 0.05
+
+# Footwear descriptions are generated under a strict no-intent-words rule so
+# that the keyword-fail demo query has no lexical anchor. If Claude leaks any of
+# these, the demo gets diluted — surface it as a WARN here.
+FOOTWEAR_BANNED_WORDS = [
+    "marathon", "race", "racing", "racer",
+    "mile", "miles", "26.2", "10K", "5K",
+    "long-distance", "long distance",
+    "endurance", "ultra", "ultramarathon",
+]
+BANNED_LEAK_THRESHOLD = 0.02
 
 
 def main():
@@ -54,9 +66,8 @@ def main():
     else:
         print(f"   [OK] All {len(REQUIRED_FIELDS)} required fields present in sample of {sample_size}")
 
-    leaked = coll.count_documents({"_product_type": {"$exists": True}})
-    if leaked:
-        print(f"   [WARN] {leaked} docs still carry the temp _product_type field")
+    # _product_type is retained by design — the smoke test asserts mode-by-mode
+    # differentiation using subtype membership, so dropping it would break the test.
 
     # --- 3. Embedding shape ---
     print("\n3. Embedding shape")
@@ -118,6 +129,24 @@ def main():
         f"   [{marker}] {short_count}/{count} ({ratio:.0%}) descriptions under "
         f"{SHORT_DESCRIPTION_THRESHOLD_CHARS} chars (likely templated fallbacks from failed Claude batches)"
     )
+
+    # --- 6b. Footwear banned-words leakage ---
+    print("\n6b. Footwear banned-words leakage")
+    footwear_total = coll.count_documents({"category": "footwear"})
+    if footwear_total == 0:
+        print("   [WARN] No footwear documents present — skipping leak check")
+    else:
+        regex = "|".join(FOOTWEAR_BANNED_WORDS)
+        leaked = coll.count_documents({
+            "category": "footwear",
+            "description": {"$regex": regex, "$options": "i"},
+        })
+        ratio = leaked / footwear_total
+        marker = "OK" if ratio <= BANNED_LEAK_THRESHOLD else "WARN"
+        print(
+            f"   [{marker}] {leaked}/{footwear_total} ({ratio:.0%}) footwear descriptions "
+            f"contain banned intent words — keyword-fail demo dilutes above {BANNED_LEAK_THRESHOLD:.0%}"
+        )
 
     # --- 7. Sample document ---
     print("\nSample document (embedding truncated):")

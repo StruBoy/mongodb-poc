@@ -23,9 +23,15 @@ st.caption("MongoDB Atlas: Atlas Search + Vector Search in a single cluster")
 # Sidebar: pre-baked demo queries (relevant to the Search tab)
 # ----------------------------------------------------------------------------
 DEMO_QUERIES = [
-    ("Marathon training", "shoes for running long distances", "footwear", 400),
-    ("Brand search",       "TrailMaster",                    "footwear", 500),
-    ("Long flights",       "comfortable for long flights",   "electronics", 800),
+    # 1. Keyword fails — banned intent vocabulary is absent from descriptions.
+    #    Semantic carries the query via concept embedding.
+    ("Marathon racing", "racing 26.2 miles", "footwear", 400),
+    # 2. Semantic fails — brand was excluded from the embedded text.
+    #    Keyword exact-matches the brand field.
+    ("Brand search",    "TrailMaster",                    "footwear", 500),
+    # 3. Both contribute — descriptions contain literal anchors AND the intent
+    #    is semantic. Hybrid blends both signals.
+    ("Long flights",    "comfortable for long flights",   "electronics", 800),
 ]
 
 st.sidebar.header("Demo queries")
@@ -58,7 +64,7 @@ with tab_search:
     col_q, col_cat, col_price = st.columns([4, 2, 2])
     query = col_q.text_input(
         "Search",
-        value=st.session_state.get("query", "shoes for running long distances"),
+        value=st.session_state.get("query", "racing 26.2 miles"),
         key="query",
     )
     cat_options = [""] + CATEGORIES

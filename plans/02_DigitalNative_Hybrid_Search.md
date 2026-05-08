@@ -548,11 +548,11 @@ streamlit run app.py
 
 ## Phase 5: Demo Polish (30 min)
 
-Curate three demo queries that visibly differentiate the modes:
+Curate three demo queries that visibly differentiate the modes. For the differentiation to land cleanly the dataset has to be tuned to match — see notes after each query.
 
-1. **`"shoes for marathon training"`** — semantic dominates because product descriptions don't say "marathon"
-2. **`"TrailMaster"`** — keyword dominates because brand names need exact matches
-3. **`"comfortable for long flights"`** + electronics category — hybrid dominates by combining "comfortable" (semantic) with category filter
+1. **`"racing 26.2 miles"`** + footwear — semantic dominates because the description prompt explicitly bans intent vocabulary (`marathon`, `race`, `mile`, `endurance`, `long-distance`, …) for footwear products. Keyword has no lexical anchor and returns near-empty / random results. Semantic embeds the concept and surfaces marathon racing + trail running shoes.
+2. **`"TrailMaster"`** + footwear — keyword dominates because the brand field is exact-matched by Atlas Search's `lucene.keyword` analyzer. Semantic loses because `product_to_text` embeds only `description + category` — the brand never enters the vector space, so semantic drifts to other trail-themed shoes regardless of brand.
+3. **`"comfortable for long flights"`** + electronics — both modes contribute. Electronics descriptions are *not* banned-word constrained, so keyword catches `comfortable`, `long`, `flights`, `travel`. Semantic catches the noise-cancelling-headphones intent. Hybrid blends them.
 
 Save these as quick-fill buttons in the sidebar:
 
@@ -560,9 +560,9 @@ Save these as quick-fill buttons in the sidebar:
 # Add to sidebar
 st.sidebar.subheader("Try these queries")
 demo_queries = [
-    ("Marathon training", "shoes for marathon training", "footwear", 400),
-    ("Brand search", "TrailMaster", "footwear", 500),
-    ("Long flights", "comfortable for long flights", "electronics", 800),
+    ("Marathon racing", "racing 26.2 miles", "footwear", 400),
+    ("Brand search",    "TrailMaster",                    "footwear", 500),
+    ("Long flights",    "comfortable for long flights",   "electronics", 800),
 ]
 for label, q, c, p in demo_queries:
     if st.sidebar.button(label):
@@ -583,10 +583,10 @@ for label, q, c, p in demo_queries:
 "This is one MongoDB cluster with about 2,500 products. There's no separate search service. There's no separate vector database. The same documents that hold the operational data also hold the embeddings for semantic search."
 
 **[1 min] Run the marathon query.**
-Type "shoes for marathon training". "Watch the three panes update simultaneously. The keyword search returns whatever happens to contain those exact words. The semantic search returns actual marathon shoes — including products whose descriptions never mention 'marathon' but talk about 'long-distance road running' or 'race-day pacing.' The hybrid pane combines both."
+Click "Marathon racing" — the query is `"racing 26.2 miles"`. "Watch the three panes update simultaneously. The keyword search has nothing to anchor on: the descriptions in this catalog don't contain words like `marathon`, `race`, `mile`, or `endurance` — those are exactly the intent terms a buyer would type. The semantic pane has no such handicap; it embeds the concept and surfaces actual marathon racing and trail running shoes. The hybrid pane carries the semantic ranking through."
 
 **[30 sec] Run the brand query.**
-Type "TrailMaster". "Now keyword wins — exact brand names need exact matches. Semantic alone might miss this. Hybrid handles both cases without you having to choose."
+Click "Brand search" — `"TrailMaster"`. "Now keyword wins decisively. Atlas Search exact-matches the brand field, so the keyword pane is 100% TrailMaster products. The semantic pane drifts to other brands' trail-themed shoes because the brand string was never embedded — vector search has no idea what `TrailMaster` is. Hybrid leans on the keyword pipeline and prioritises the exact-brand hits."
 
 **[30 sec] Land the architectural point.**
 "This is one cluster. One query language. One set of indexes to maintain. The reason this matters isn't that semantic search is faster — it's that the team building this product gets to focus on the product instead of on synchronizing three systems."
@@ -625,3 +625,9 @@ rm -rf poc-hybrid-search
 - **Add personalization**: store user click history, embed it, blend user-vector into the query vector for re-ranking
 - **Add image search**: use a multimodal embedding model (e.g. Voyage's multimodal model) and let users upload an image to find similar products
 - **A/B test mode**: route 50% of synthetic "users" to keyword, 50% to hybrid, and show conversion-rate-style metrics to make a commercial argument
+
+## Demo trade-offs to flag if asked
+
+- The footwear description prompt deliberately bans intent vocabulary (`marathon`, `race`, `mile`, `endurance`, `long-distance`, …) to make the keyword-fail demo land. In a real catalog you would *want* those words present — the constraint exists only to expose the differentiation between modes on a small corpus. Other categories are unconstrained.
+- The Claude prompt does NOT receive the brand name, only `(product_type, category)`. Without that, descriptions tinted themselves toward the brand (e.g., `TrailMaster trail running shoe` → unusually trail-emphatic descriptions) and a small number leaked the brand string verbatim, both of which let semantic search resolve brand-only queries. After the change, descriptions are brand-agnostic and a regex pass strips any accidental brand mention before insert.
+- `product_to_text` embeds only `description + category` — the brand string is intentionally excluded so semantic search loses brand-only queries. In production you would normally include the brand in the embedded text so the vector pipeline can also resolve brand-affiliated queries; the demo strips it to make the keyword-wins case unambiguous.

@@ -91,7 +91,7 @@ Confirms count (~2,500), required fields, embedding dimensionality, category and
 python -m scripts.smoke_test
 ```
 
-Runs keyword (Atlas Search), semantic (Vector Search), and hybrid (`$rankFusion`) against the query `"shoes for running long distances"` with category=footwear, max_price=400. Should return 5 hits per mode with sensible scores.
+Runs keyword, semantic, and hybrid against all three sidebar demo queries and asserts the differentiation, not just non-empty results: keyword should miss on the marathon query, semantic should miss on the brand query, both should contribute on the long-flights query, and hybrid should always come back non-empty. Exits non-zero if any of those expectations break.
 
 ### 8. Launch the demo UI
 
@@ -107,17 +107,21 @@ The sidebar offers three pre-baked demo queries that highlight when each mode wi
 
 ### Demo flow
 
-The story: one Atlas cluster, three retrieval modes, and `$rankFusion` merging them in a native aggregation stage — no separate vector DB, no embedding pipeline, no sync layer.
+The story: one Atlas cluster, three retrieval modes, and `$rankFusion` merging them in a native aggregation stage — no separate vector DB, no embedding pipeline, no sync layer. Each demo query is engineered to make exactly one mode win, so the hybrid pane is the only one that wins all three.
 
-1. **Marathon training** sidebar query — all three modes return relevant footwear, but the hybrid panel ranks the marathon-relevant products first by combining brand-matched and intent-matched signals.
-2. **Brand search** ("TrailMaster") — keyword nails the brand directly; semantic drifts toward thematically similar but unbranded items. Hybrid prioritizes the exact-brand hits.
-3. **Long flights** ("comfortable for long flights") — semantic understands intent and surfaces noise-cancelling headphones; keyword has nothing useful to match against. Hybrid passes the semantic ranking through.
+1. **Marathon racing** sidebar query — `"racing 26.2 miles"`. The keyword pane is empty or shows random non-running footwear: footwear descriptions are generated under a banned-words rule that strips `marathon`, `race`, `mile`, `endurance`, `long-distance`, etc., so keyword search has no lexical anchor. The semantic pane surfaces marathon racing and trail running shoes via concept embedding. Hybrid carries the semantic ranking through.
+2. **Brand search** ("TrailMaster") — the keyword pane is 100% TrailMaster products (Atlas Search exact-matches the brand field). The semantic pane drifts to other brands' trail-themed shoes because `product_to_text` embeds only `description + category` — the brand never enters the vector. Hybrid leans on the keyword pipeline and prioritises the exact-brand hits.
+3. **Long flights** (`"comfortable for long flights"`, electronics) — both modes contribute. Electronics descriptions are unconstrained, so keyword catches `comfortable`, `long`, `flights`, `travel`. Semantic catches the noise-cancelling-headphones intent. Hybrid blends them.
 4. Switch to the **📋 Full catalog** tab to show the same documents are available for operational queries — same cluster, same collection.
 
 Architectural points to land:
 - One cluster, one query language, no sync pipelines.
 - `$rankFusion` is a native aggregation stage (MongoDB 8.1+) — reciprocal-rank-fusion without client-side glue.
 - The same `products` collection powers keyword, semantic, and hybrid retrieval simultaneously.
+
+Trade-offs worth flagging if asked:
+- Footwear descriptions are deliberately scrubbed of intent vocabulary so the keyword-fail demo lands on a small corpus. In a real catalog you would *want* those words present — semantic and keyword would still differ in ranking, just less dramatically.
+- `product_to_text` excludes the brand from the embedded text. In production you would normally include it so semantic also resolves brand-affiliated queries; the demo strips it to make the keyword-wins case unambiguous.
 
 ## Deploy the Fraud Detection PoC
 

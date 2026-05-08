@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import re
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -52,17 +53,83 @@ BRANDS = {
     "sports": ["FlexCore", "AthleteOne", "VeloPath", "PulseGear", "MotionWright"],
 }
 
+# Per-category words Claude must avoid in descriptions. The footwear list strips
+# the lexical anchors a keyword search for an intent query like "footwear for
+# racing 26.2 miles" would latch onto — forcing semantic search to carry that
+# query in the demo. Other categories are left unconstrained so the
+# "comfortable for long flights" demo still has natural keyword anchors.
+BANNED_WORDS = {
+    "footwear": [
+        "marathon", "race", "racing", "racer",
+        "mile", "miles", "26.2", "10K", "5K",
+        "long-distance", "long distance",
+        "endurance", "ultra", "ultramarathon",
+    ],
+}
+
+
+def _banned_words_for(items: list[tuple]) -> list[str]:
+    """Union of banned words across the categories present in the batch."""
+    banned = set()
+    for _product_type, category in items:
+        banned.update(BANNED_WORDS.get(category, []))
+    return sorted(banned)
+
+
+# All brand names across all categories. Brand is NOT passed to Claude (so
+# descriptions stay brand-agnostic and the semantic-fail brand demo lands), but
+# we sanitize the response too as a belt-and-braces measure in case Claude
+# coincidentally invents a real brand string.
+ALL_BRANDS = {b for blist in BRANDS.values() for b in blist}
+
+
+def _strip_brand_mentions(text: str) -> str:
+    """Remove any brand-name occurrences from a description, case-insensitive."""
+    for brand in ALL_BRANDS:
+        text = re.sub(re.escape(brand), "", text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _scrub_banned_words(text: str, banned: list[str]) -> str:
+    """Strip whole-word occurrences of any banned term from `text`.
+
+    Defense in depth: even with the strict prompt rule, Claude leaks ~2% of the
+    time. We strip on word boundaries so substrings like 'mileage' or
+    'gracefully' (which BM25 tokenises separately and won't match a query for
+    'mile' / 'race') are left intact, while literal matches that would defeat
+    the keyword-fail demo are removed.
+    """
+    if not banned:
+        return text
+    pattern = r"\b(" + "|".join(re.escape(b) for b in banned) + r")\b"
+    text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+([,.])", r"\1", text)
+    text = re.sub(r"\.\.+", ".", text)
+    return re.sub(r"\s+", " ", text).strip()
+
 
 def generate_description_batch(items: list[tuple]) -> list[str]:
-    """Use Claude to generate realistic product descriptions in one batch call."""
+    """Use Claude to generate realistic product descriptions in one batch call.
+
+    Brand is intentionally NOT included in the prompt — descriptions must stay
+    brand-agnostic so that semantic search cannot resolve brand-only queries.
+    """
     prompt = (
         "Generate a realistic product description (40-60 words) for each of these products. "
         "Return as a JSON array of strings, one description per product, in the same order. "
         "Descriptions should be evocative but not use the exact product type name. "
-        "Return ONLY the JSON array, no other text.\n\n"
+        "Do NOT invent or include any brand name in the description. "
     )
-    for i, (title, brand, category) in enumerate(items, 1):
-        prompt += f"{i}. {brand} {title} ({category})\n"
+    banned = _banned_words_for(items)
+    if banned:
+        prompt += (
+            "Strict rule: do NOT use any of these words or phrases (case-insensitive) "
+            f"anywhere in the description: {', '.join(banned)}. "
+            "Use roundabout language about pace, cushioning, tempo, propulsion, road feel, etc. "
+        )
+    prompt += "Return ONLY the JSON array, no other text.\n\n"
+    for i, (product_type, category) in enumerate(items, 1):
+        prompt += f"{i}. {product_type} ({category})\n"
 
     response = anthropic.messages.create(
         model="claude-haiku-4-5-20251001",
@@ -74,7 +141,9 @@ def generate_description_batch(items: list[tuple]) -> list[str]:
         text = text.split("```")[1]
         if text.startswith("json"):
             text = text[4:]
-    return json.loads(text.strip())
+    descriptions = json.loads(text.strip())
+    banned = _banned_words_for(items)
+    return [_scrub_banned_words(_strip_brand_mentions(d), banned) for d in descriptions]
 
 
 def generate_catalog(target_count: int = 2500):
@@ -108,7 +177,7 @@ def main():
     print("Generating descriptions via Claude...")
     for i in range(0, len(items), 25):
         batch = items[i:i + 25]
-        tuples = [(it["_product_type"], it["brand"], it["category"]) for it in batch]
+        tuples = [(it["_product_type"], it["category"]) for it in batch]
         try:
             descriptions = generate_description_batch(tuples)
             for it, desc in zip(batch, descriptions):
@@ -116,9 +185,10 @@ def main():
         except Exception as e:
             print(f"  Batch {i} failed: {e}; using fallback.")
             for it in batch:
-                it["description"] = f"Premium {it['_product_type']} from {it['brand']}."
+                # Fallback skips _product_type because it can contain banned words
+                # (e.g., "marathon racing shoe") that would defeat the keyword-fail demo.
+                it["description"] = f"Premium product from {it['brand']}."
         for it in batch:
-            it.pop("_product_type", None)
             it.setdefault("description", f"Premium product from {it['brand']}.")
         if i % 100 == 0:
             print(f"  ...{i}/{len(items)}")

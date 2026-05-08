@@ -6,3 +6,4 @@ __pycache__/
 .claude/settings.local.json
 .DS_Store
 MongoDB POC/
+.claude/scheduled_tasks.lock
