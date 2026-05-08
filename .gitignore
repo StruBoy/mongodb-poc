@@ -4,3 +4,5 @@ secrets.txt
 .env.local
 __pycache__/
 .claude/settings.local.json
+.DS_Store
+MongoDB POC/
