@@ -1,0 +1,7 @@
+pymongo
+voyageai
+anthropic
+streamlit
+python-dotenv
+certifi
+cryptography

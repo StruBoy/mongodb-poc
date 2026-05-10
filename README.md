@@ -1,6 +1,6 @@
 # MongoDB APAC PoC playbook
 
-Five customer-segment proofs-of-concept built on MongoDB Atlas. Each one demonstrates that a single Atlas cluster can replace a multi-system stack (operational DB + search + vector + warehouse). The detailed playbooks live under [`plans/`](./plans).
+Six customer-segment proofs-of-concept built on MongoDB Atlas. Each one demonstrates that a single Atlas cluster can replace a multi-system stack (operational DB + search + vector + warehouse). The detailed playbooks live under [`plans/`](./plans).
 
 | # | PoC | Status | Demonstrates |
 |---|---|---|---|
@@ -9,17 +9,19 @@ Five customer-segment proofs-of-concept built on MongoDB Atlas. Each one demonst
 | 3 | [RAG Knowledge Base](./plans/03_AI_RAG_Knowledge_Base.md) (AI-native) | **Implemented** in [`ai-kb/`](./ai-kb) | Self-updating retrieval with no sync pipeline |
 | 4 | [Citizen Case Mgmt](./plans/04_GovTech_Case_Management.md) (GovTech) | **Implemented** in [`govtech-casemgmt/`](./govtech-casemgmt) | Polymorphic docs + field-level encryption |
 | 5 | [IoT Telemetry](./plans/05_Telco_IoT_Telemetry.md) (Telco) | **Implemented** in [`iot-telemetry/`](./iot-telemetry) | Time-series collections + real-time aggregations |
+| 6 | EMR RAG (Healthcare) | **Implemented** in [`emr-rag/`](./emr-rag) | RAG over patient records + polymorphic visit schemas + PHI encryption |
 
 ## Prerequisites
 
 - MongoDB Atlas cluster (M10 recommended; **8.1+** required for hybrid-search's `$rankFusion`, any 8.x is fine for the others)
 - `pocuser` account with `readWriteAnyDatabase` role
 - Atlas connection string in each PoC's `.env`, see `.env.example`
-- Voyage AI account with payment method on file (PoCs 1, 2, 3 — `voyage-3` embeddings)
-- Anthropic API key (PoCs 2, 3 — Claude haiku 4.5 for description synthesis and RAG generation)
+- Voyage AI account with payment method on file (PoCs 1, 2, 3, 6 — `voyage-3` embeddings)
+- Anthropic API key (PoCs 2, 3, 6 — Claude haiku 4.5 for description synthesis and RAG generation)
 - Python 3.11+
 - IoT telemetry PoC (5) needs neither Voyage nor Anthropic — pure time-series + aggregations
 - GovTech case management PoC (4) needs neither Voyage nor Anthropic either — it uses application-side AES-256-GCM for field-level encryption (an extra `ENCRYPTION_KEY` env var, generated locally)
+- EMR RAG PoC (6) needs Voyage + Anthropic + an `ENCRYPTION_KEY` (PHI fields use the same AES-256-GCM pattern as PoC 4)
 
 Each PoC lives in its own directory with its own venv, `.env`, and Atlas project. They can be deployed independently.
 
@@ -540,6 +542,124 @@ Architectural points to land:
 - `dynamic: true` on the Atlas Search index turns the polymorphism advantage into a unified search story without per-type mappings.
 - Field-level encryption for PII is application-side AES-256-GCM here for clarity; in production, MongoDB Queryable Encryption pushes the same pattern into the database itself with key-vault-managed keys and equality / range query support against ciphertext.
 
+## Deploy the EMR RAG PoC
+
+Total spin-up time on a clean machine: ~10 min, plus ~1 min for seed generation. Combines the auto-embedding RAG pattern from PoC #3 with the polymorphic-collection + field-encryption pattern from PoC #4. The demo's clinical arc — undiagnosed obstructive sleep apnoea unifying treatment-resistant anxiety, prediabetes, and nocturnal arrhythmia — is grounded in real clinical literature so the prognosis shift in the AI summary is plausible to clinically-literate audiences.
+
+### 1. Provision the Atlas cluster
+
+In the Atlas console:
+
+1. Create project `poc-emr-rag` (or reuse an existing PoC project — each PoC uses its own database, so they coexist on one cluster)
+2. Build cluster: **M10**, any MongoDB 8.x
+3. **Database Access** → add user `pocuser` with `readWriteAnyDatabase`
+4. **Network Access** → add your current IP (or `0.0.0.0/0` for the demo only — revoke after)
+5. **Connect → Drivers** → copy the SRV connection string
+
+### 2. Configure local environment
+
+```bash
+cd emr-rag
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+cp .env.example .env
+# Edit .env and set:
+#   MONGODB_URI=<paste from Atlas Connect, with your password substituted>
+#   VOYAGE_API_KEY=<from voyageai.com — payment method must be on file>
+#   ANTHROPIC_API_KEY=<from console.anthropic.com>
+#   ENCRYPTION_KEY=<generate via the command in .env.example>
+```
+
+Generate a fresh AES-256 key:
+
+```bash
+python -c "import os, base64; print(base64.b64encode(os.urandom(32)).decode())"
+```
+
+### 3. Verify connectivity
+
+```bash
+python -m scripts.check_env
+```
+
+Seven checks: env vars, MongoDB ping, `emr_demo` db / collections, AES-256-GCM round-trip on the encryption key, Voyage authentication, Voyage rate-limit (confirms a payment method is configured), and Anthropic authentication. All seven should report `[OK]`.
+
+### 4. Create the database, collections, and vector index
+
+```bash
+python -m scripts.create_db_index
+```
+
+Idempotent. Creates `emr_demo.patients` and `emr_demo.visits`, plus the 1024-dim cosine vector index `kb_visits_idx` (with `patient_id` and `specialty` as filter fields), then polls until queryable.
+
+### 5. Generate the seed patient and visits
+
+```bash
+python -m data.generate
+```
+
+Creates one demo patient (`pat-001`, "Maria Chen", 47F, BMI 31) with three encrypted PHI fields (national_id, dob, insurance_id) and **6 seed visits** across 4 specialties — general practice, psychiatry, cardiology, endocrinology — drawn over the last 8 months. Each visit's body is expanded by Claude haiku 4.5 from a structured fixture (specialty, vitals, scores, lab values, plan) and then embedded via voyage-3 on the same write path the editor uses. Takes ~1 minute; cost is well under USD 0.10. The seed picture is intentionally fragmented — nothing in the seed mentions OSA, sleep apnoea, AHI, or CPAP. That's what makes the diagnostic pivot in step 8 land.
+
+### 6. Verify the seed loaded correctly
+
+```bash
+python -m scripts.verify_data
+```
+
+Seven checks: demo patient exists with PHI envelopes that round-trip, exactly 6 seed visits, all required visit fields present, embeddings are 1024-dim, all 4 expected specialties represented, no body shorter than 400 chars (catches fallback templates), no premature OSA terms in the seed, vector index queryable. Exits non-zero on any structural failure.
+
+### 7. Smoke-test the prognosis arc
+
+```bash
+python -m scripts.smoke_test
+```
+
+Six steps that prove the demo's "wow" lands automatically:
+1. Generate clinical summary BEFORE follow-ups; assert no confident OSA diagnosis (no AHI / polysomnography / CPAP).
+2. Ask "What's driving her poor sleep?" → assert top source is a psychiatry visit.
+3. `add_followup_batch` → asserts 4 new visits land, including 1 `sleep_medicine` (the novel specialty).
+4. Re-summarise; assert the new summary explicitly diagnoses OSA, cites diagnostic evidence, and frames OSA as the unifying upstream cause. Prints both summaries side-by-side.
+5. Ask "What is her CPAP plan?" → assert sleep_medicine is the top source (proves the novel-specialty visit was indexed end-to-end with no migration step).
+6. Re-ask the sleep question → assert the sleep_medicine visit now appears among sources (same question, fundamentally better answer).
+Cleanup removes the follow-up batch so the demo opens clean.
+
+### 8. Launch the demo UI
+
+```bash
+streamlit run app.py
+```
+
+At `http://localhost:8501`:
+
+- **Sidebar** — persona toggle (`🩺 GP view` / `🧑 Patient view`), patient selector, **➕ Add follow-up visits** and **↺ Reset to seed** buttons, persona-specific demo prompts, clear-chat
+- **Patient header** — name, age, BMI, primary GP, plus a collapsible PHI panel that decrypts national_id / dob / insurance_id from their AES-256-GCM envelopes
+- **📋 AI overview** — 3–5 sentence summary plus 3 focus-area bullets, generated on demand. Persona toggle changes the voice (clinical vs plain English) without changing the data
+- **🗂️ Visit timeline** — chronological, expandable per visit, color-coded by specialty (each card shows the full body and the structured fields)
+- **💬 Q&A chat** — patient-scoped `$vectorSearch` filtered by `patient_id`; sources expander shows visit ID, specialty, date, and similarity score per source
+
+### Demo flow
+
+The story: every other healthcare data architecture has visits fragmented across one system per specialty. Here, every specialty's notes — with completely different shapes — live in one MongoDB collection, every insert auto-embeds, the AI summary is always reading current data, and adding a never-before-seen specialty is an `insertOne`, not a project plan.
+
+1. **Frame the structural problem (1 min).** "Patient records live across specialty silos — each clinic system has its own schema, its own database, its own search. The cost is not just integration: it's that nobody sees the picture across specialties, and patients like the one I'm about to show you slip through the gaps for months."
+2. **GP view, steady state (1.5 min).** Open Maria Chen's record in 🩺 GP view. The AI overview summarises 6 visits across 4 specialties: prediabetes worsening despite metformin, treatment-resistant anxiety + insomnia, palpitations attributed to anxiety. Read the prognosis aloud — the trajectory isn't converging. Scroll the timeline; point at the cardiology ECG fields vs the psych PHQ-9 vs the endo HbA1c. **All different shapes, one MongoDB collection.**
+3. **Patient view (45 sec).** Toggle to 🧑 Patient view, click 🔄 Refresh summary. Same data, plain English, gentle non-specific focus areas because there's no clear answer yet.
+4. **The diagnostic pivot — *the moment* (2 min).** Back in GP view, click ➕ Add follow-up visits. The summary auto-refreshes. Read the new prognosis aloud — newly diagnosed moderate-severe OSA (AHI 24) **retrospectively unifying** the prediabetes, the anxiety, and the nocturnal arrhythmia, with a favourable prognosis on CPAP. Three points to land while the audience reads:
+   - The summary's *prognosis* changed from "fragmented, not converging" to "unified, treatable, expect measurable improvement." That's the LLM doing what a good clinician does: integrating across specialties.
+   - The new visit type (`sleep_medicine`) has fields no other visit had — `ahi_per_hour`, `nadir_spo2_pct`, `cpap_pressure_cmH2O`. **No schema migration ran.** The collection just accepted the new shape.
+   - **No re-embedding pipeline ran.** The four new visits embedded on the same write path as every other insert. The summary you just read came out of a `$vectorSearch` over a corpus that is four documents bigger than it was 30 seconds ago.
+5. **Toggle to patient view (45 sec).** Click 🔄 Refresh summary. The plain-English version now leads with the OSA diagnosis and concrete next steps ("Use CPAP every night, aim for 4+ hours"). Same underlying data, different audience, same one MongoDB collection.
+6. **Q&A drill-down (60 sec).** Back in GP view, ask "What's driving Maria's poor sleep?" — the answer now cites the sleep_medicine visit. Then "Should we have caught this earlier?" — the LLM looks across the timeline and points at the unrefreshing-sleep mention in the seed psych note, the BMI 31 from the GP visit, and the nocturnal pattern of PVCs. **This is the cross-specialty reasoning that the silos prevent.**
+7. **Land the points (30 sec).** "One MongoDB collection holds five specialties with five different shapes. Every insert re-embeds on the same write path so the AI summary is always reading current data. PHI is encrypted at rest in the same documents — flip open the PHI panel to show the ciphertext envelopes. This is one cluster doing what would normally take a clinical data warehouse, a vector store, a re-embedding pipeline, and a separate encryption tier — and the clinical value is what the audience just watched: a treatment-resistant patient whose prognosis flipped because the data was finally in one place."
+
+Architectural points to land:
+- One cluster, one `visits` collection, five specialty schemas inside it (the sleep_medicine visit has fields no other visit has).
+- Every visit insert re-embeds via voyage-3 on the same write path — `src/visits.py:upsert_visit` is the only code path the seed generator and the add-follow-up button both call, so the AI summary is always reading current data with no separate sync layer.
+- PHI fields are application-side AES-256-GCM here for clarity; in production, MongoDB Queryable Encryption pushes the same pattern into the database itself.
+- The clinical narrative — OSA unifying treatment-resistant anxiety, metformin-resistant prediabetes, and nocturnal arrhythmia — is well-documented in the literature ("Syndrome Z"), so the prognosis shift the audience watches is grounded in real clinical reasoning.
+
 ## Project layout
 
 ```
@@ -574,13 +694,20 @@ mongodb_poc/
 │   ├── src/               ← db, crypto (AES-256-GCM), services (Atlas Search + add-new-type)
 │   ├── scripts/           ← check_env, create_db_index, verify_data, smoke_test
 │   └── data/              ← generate.py
-└── iot-telemetry/         ← implemented PoC #5
-    ├── app.py             ← Streamlit operations dashboard
+├── iot-telemetry/         ← implemented PoC #5
+│   ├── app.py             ← Streamlit operations dashboard
+│   ├── requirements.txt
+│   ├── .env.example
+│   ├── src/               ← db (sync + async), analytics
+│   ├── scripts/           ← check_env, create_db_index, verify_data, smoke_test
+│   └── data/              ← generate_fleet.py, stream_telemetry.py
+└── emr-rag/               ← implemented PoC #6
+    ├── app.py             ← Streamlit (GP / Patient persona toggle, summary, timeline, chat)
     ├── requirements.txt
     ├── .env.example
-    ├── src/               ← db (sync + async), analytics
+    ├── src/               ← db, embed, crypto (AES-256-GCM), patients, visits (auto-embed), rag (persona-aware)
     ├── scripts/           ← check_env, create_db_index, verify_data, smoke_test
-    └── data/              ← generate_fleet.py, stream_telemetry.py
+    └── data/              ← generate.py (seed via Claude), followup_visits.py (canned demo batch)
 ```
 
 ## Cleanup
