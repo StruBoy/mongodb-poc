@@ -79,11 +79,20 @@ def throughput_timeline(window_seconds: int = 120) -> list[dict]:
     Plays as a stacked-or-grouped line chart in the dashboard. The $dateTrunc
     bucketing relies on MongoDB's native time-series support — no app-side
     bucketing required.
+
+    The upper bound on `ts` excludes the bucket the streamer is currently
+    writing into. Each cycle lands as two concurrent insert_many(500) chunks
+    via asyncio.gather; a query that reads between the two completions sees
+    a partial bucket, which on the chart shows as a vertical drop to the
+    x-axis. Streamer cycle is ~1s, so a 2s guard always gives the in-flight
+    cycle time to fully flush.
     """
     db = get_db()
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=window_seconds)
+    upper = now - timedelta(seconds=2)
     pipeline = [
-        {"$match": {"ts": {"$gte": cutoff}}},
+        {"$match": {"ts": {"$gte": cutoff, "$lt": upper}}},
         {"$group": {
             "_id": {
                 "second": {"$dateTrunc": {"date": "$ts", "unit": "second"}},
