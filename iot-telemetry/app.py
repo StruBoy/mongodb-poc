@@ -182,6 +182,8 @@ def render_live_dashboard():
     if not health:
         st.info("Waiting for telemetry to accumulate…")
     else:
+        district_order = {"West": 0, "Central": 1, "East": 2}
+        health = sorted(health, key=lambda r: district_order.get(r["region"], 99))
         cols = st.columns(len(health))
         for col, region in zip(cols, health):
             is_degraded = region["avg_packet_loss"] > PACKET_LOSS_ALERT_PCT
@@ -241,7 +243,7 @@ def render_live_dashboard():
             color_discrete_map={"healthy": "#2ca02c", "failing": "#d62728"},
             hover_name="tower_id",
             hover_data={"region": True, "type": True, "lat": False, "lon": False, "state": True},
-            zoom=10,
+            zoom=9,
             center={"lat": 1.32, "lon": 103.83},
             height=380,
         )

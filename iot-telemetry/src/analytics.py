@@ -86,6 +86,12 @@ def throughput_timeline(window_seconds: int = 120) -> list[dict]:
     a partial bucket, which on the chart shows as a vertical drop to the
     x-axis. Streamer cycle is ~1s, so a 2s guard always gives the in-flight
     cycle time to fully flush.
+
+    Aggregation is two-stage: first sum per cycle (events from one streamer
+    cycle share an identical ts), then average those per-cycle totals into
+    second-aligned buckets. A naive $sum over the whole second double-counts
+    on the seconds where cycle timing drift lands two cycles in the same
+    bucket, which shows up on the chart as a 2x spike.
     """
     db = get_db()
     now = datetime.now(timezone.utc)
@@ -94,12 +100,17 @@ def throughput_timeline(window_seconds: int = 120) -> list[dict]:
     pipeline = [
         {"$match": {"ts": {"$gte": cutoff, "$lt": upper}}},
         {"$group": {
+            "_id": {"ts": "$ts", "region": "$meta.region"},
+            "cycle_throughput": {"$sum": "$throughput_mbps"},
+            "cycle_tower_count": {"$sum": 1},
+        }},
+        {"$group": {
             "_id": {
-                "second": {"$dateTrunc": {"date": "$ts", "unit": "second"}},
-                "region": "$meta.region",
+                "second": {"$dateTrunc": {"date": "$_id.ts", "unit": "second"}},
+                "region": "$_id.region",
             },
-            "total_throughput_mbps": {"$sum": "$throughput_mbps"},
-            "tower_count": {"$sum": 1},
+            "total_throughput_mbps": {"$avg": "$cycle_throughput"},
+            "tower_count": {"$avg": "$cycle_tower_count"},
         }},
         {"$project": {
             "ts": "$_id.second",
