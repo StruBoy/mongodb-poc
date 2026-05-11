@@ -23,7 +23,7 @@ Seven customer-segment proofs-of-concept built on MongoDB Atlas. Each one demons
 - IoT telemetry PoC (5) needs neither Voyage nor Anthropic — pure time-series + aggregations
 - GovTech case management PoC (4) needs neither Voyage nor Anthropic either — it uses application-side AES-256-GCM for field-level encryption (an extra `ENCRYPTION_KEY` env var, generated locally)
 - EMR RAG PoC (6) needs Voyage + Anthropic + an `ENCRYPTION_KEY` (PHI fields use the same AES-256-GCM pattern as PoC 4)
-- Data Residency PoC (7) needs **Atlas Global Cluster** (M30+, three zones US / EU / APAC mapped to AWS us-east-1 / eu-central-1 / ap-southeast-1) — significantly more expensive than the M10s above (~USD 24/day while running). **Pause between sessions.** No Voyage / Anthropic / encryption keys required.
+- Data Residency PoC (7) needs **Atlas Global Cluster** (M30+, multi-cloud: three zones US / EU / APAC mapped to AWS `us-east-1` / Azure `germanywestcentral` / GCP `asia-southeast1`) — significantly more expensive than the M10s above (~USD 24/day while running). **Pause between sessions.** No Voyage / Anthropic / encryption keys required.
 
 Each PoC lives in its own directory with its own venv, `.env`, and Atlas project. They can be deployed independently.
 
@@ -676,8 +676,9 @@ Atlas Global Clusters are not configurable from application code; the topology a
    - MongoDB version 8.x
    - Add three Zones:
      - Zone `US`   → AWS `us-east-1` (Virginia)
-     - Zone `EU`   → AWS `eu-central-1` (Frankfurt)
-     - Zone `APAC` → AWS `ap-southeast-1` (Singapore)
+     - Zone `EU`   → Azure `germanywestcentral` (Frankfurt)
+     - Zone `APAC` → GCP `asia-southeast1` (Singapore)
+   - Multi-cloud is intentional: it demonstrates that the residency contract holds not just across regions but across cloud providers, with the same single connection string and unchanged application code.
    - Each zone gets its own M30 replica set, becoming a shard tagged for that zone.
 3. **Database Access** → add user `pocuser` with **both** `readWriteAnyDatabase` AND `clusterMonitor` roles. The `clusterMonitor` role is needed for `listShards`, `config.chunks` reads, and `$collStats` per-shard reads.
 4. **Network Access** → add your current IP (or `0.0.0.0/0` for the demo only — revoke after).
@@ -701,9 +702,9 @@ The application user can create empty collections but cannot shard them on a Glo
    - Second shard key field: `_id`
    - (Optional) Tick **Pre-split data for even distribution** if shown — gives more visible chunk count in `sh.status()` without needing `splitChunk` privilege.
    - Atlas will prompt for the zone code mapping the first time you shard a collection in this database. **Location codes must be valid ISO 3166-1 alpha-2 country codes** — Atlas silently buckets unknown codes into a default zone, which collapses two of your shards into one. Use these three representative codes:
-     - `US` → US zone (us-east-1)
-     - `DE` → EU zone (eu-central-1)
-     - `SG` → APAC zone (ap-southeast-1)
+     - `US` → US zone (AWS us-east-1)
+     - `DE` → EU zone (Azure germanywestcentral)
+     - `SG` → APAC zone (GCP asia-southeast1)
 3. Repeat step 2 for the `orders` collection with second shard key field `customer_id`. The zone-code mapping defined in step 2 is shared across all collections sharded with Global Writes in this database; you don't enter it again.
 
 The three location codes (`US`, `DE`, `SG`) are hard-coded in `src/zones.py:LOCATION_CODE_FOR_ZONE` and must match Atlas's configured codes character-for-character. The application UI continues to display the zones as `US` / `EU` / `APAC` for clarity; the translation between zone names (UI vocabulary) and ISO country codes (on-disk storage) happens in `src/zones.py`.
@@ -780,8 +781,8 @@ The story: one logical Atlas cluster, three physical regions, one query path. Re
 1. **Frame the residency problem (1 min).** "Every global SaaS hits the same wall: a customer's compliance team says their data has to live in their region. The off-MongoDB answer is one cluster per region and a routing layer in your application. That's a fork in your data architecture every time a regulator changes a rule."
 2. **Show the architecture (1 min).** "This is one logical Atlas Global Cluster. Three physical regions: Virginia, Frankfurt, Singapore. The customers and orders collections are sharded — the shard key starts with a `location` field, and the zone definitions tie each value to one of those regions. The application connects to one URI; the driver handles the rest."
 3. **Steady state (30 sec).** Sidebar shows 100 customers in US shard, EU and APAC empty. Map shows business locations all over the world but every line points to Virginia. The data was inserted in one region, regardless of where the customer actually operates.
-4. **Bulk migrate (1.5 min).** Click **🌍 Migrate to natural regions**. The sidebar counters fan out — US drops, EU and APAC fill in. The map redraws with each customer's data line flipping to their natural data-centre. Open the Inspect panel on one APAC-domiciled customer to show the explain output reports their docs now live on `ap-southeast-1`-tagged shard.
-5. **Per-customer override (1.5 min).** "An APAC bank says: actually, our group treasury is in Frankfurt, we want our data in EU instead." Edit a row in the customer table, change Data zone from `APAC` to `EU`, click Submit. The progress bar shows the migration completing in ~1 second. The map line redraws. The inspector now reports the customer doc and orders on `eu-central-1`-tagged shard.
+4. **Bulk migrate (1.5 min).** Click **🌍 Migrate to natural regions**. The sidebar counters fan out — US drops, EU and APAC fill in. The map redraws with each customer's data line flipping to their natural data-centre. Open the Inspect panel on one APAC-domiciled customer to show the explain output reports their docs now live on the GCP `asia-southeast1` shard.
+5. **Per-customer override (1.5 min).** "An APAC bank says: actually, our group treasury is in Frankfurt, we want our data in EU instead." Edit a row in the customer table, change Data zone from `APAC` to `EU`, click Submit. The progress bar shows the migration completing in ~1 second. The map line redraws. The inspector now reports the customer doc and orders on the Azure `germanywestcentral` shard — **a cross-cloud move from GCP Singapore to Azure Frankfurt with one field update.**
 6. **Reset (30 sec).** Click **↺ Reset all to US**. Every line redraws back to Virginia as 100 customers' data migrates home. The takeaway: residency is a property of *data*, not of *infrastructure*.
 7. **Land the architectural points (30 sec).** "One cluster, one query language, one connection string. Residency is a `location` field. Customers can change their declared region and your application is unchanged. This is what 'cloud-native data residency' should mean."
 

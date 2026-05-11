@@ -19,7 +19,10 @@ Then:
 """
 from __future__ import annotations
 
+import threading
+import time
 from collections import Counter
+from collections.abc import Iterator
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -28,12 +31,15 @@ import streamlit as st
 from src.customers import customer_count_by_location, list_customers
 from src.db import get_db
 from src.migration import (
+    clear_active_job,
     discover_zone_to_shard,
+    get_active_job,
+    iter_migrations_to_natural_regions,
+    iter_reset_to_us,
     list_shards,
-    migrate_all_to_natural_regions,
-    migrate_customer,
+    migrate_batch_iter,
     physical_shard_for_customer,
-    reset_all_to_us,
+    set_active_job,
     shard_distribution_overview,
 )
 from src.orders import order_count_by_location, order_count_for_customer
@@ -62,43 +68,87 @@ if "table_version" not in st.session_state:
 
 
 # ---------------------------------------------------------------------------
+# Background-job machinery — keeps the UI responsive during long migrations
+# ---------------------------------------------------------------------------
+def _bump_table_version():
+    st.session_state.table_version += 1
+
+
+def _migration_in_flight() -> bool:
+    job = get_active_job()
+    return bool(job and job.get("status") == "running")
+
+
+def _start_migration_job(label: str, total: int, gen: Iterator[dict]) -> None:
+    """Spawn a worker thread that consumes `gen` and appends each per-customer
+    result to the process-global active job. The Streamlit script returns
+    immediately so the page can render the live feed.
+
+    The job lives in `src.migration` at module scope (not in
+    `st.session_state`) so a browser refresh mid-migration picks up the same
+    in-flight job in the new session.
+    """
+    if total == 0:
+        st.session_state.last_action = f"{label}: nothing to migrate (all customers already in place)."
+        return
+
+    job: dict = {
+        "label": label,
+        "status": "running",
+        "total": total,
+        "completed": [],
+        "error": None,
+        "started_at": time.time(),
+        "ended_at": None,
+    }
+    set_active_job(job)
+
+    def _run() -> None:
+        try:
+            for result in gen:
+                job["completed"].append(result)
+            job["status"] = "done"
+        except Exception as exc:
+            job["error"] = repr(exc)
+            job["status"] = "error"
+        finally:
+            job["ended_at"] = time.time()
+
+    thread = threading.Thread(target=_run, name=f"migration:{label}", daemon=True)
+    thread.start()
+
+
+# ---------------------------------------------------------------------------
 # Sidebar — controls + live cluster + inspector
 # ---------------------------------------------------------------------------
 st.sidebar.header("Demo controls")
+buttons_disabled = _migration_in_flight()
 bulk_clicked = st.sidebar.button(
     "🌍 Migrate to natural regions",
     use_container_width=True,
+    disabled=buttons_disabled,
     help=(
         "Move every customer to the zone matching their business country: "
-        "AMER → US, EMEA → EU, APAC → APAC. Sequential, ~30s for 100 customers."
+        "AMER → US, EMEA → EU, APAC → APAC. Runs in the background; watch the "
+        "live feed."
     ),
 )
 reset_clicked = st.sidebar.button(
     "↺ Reset all to US",
     use_container_width=True,
+    disabled=buttons_disabled,
     help="Move everyone back to the US zone.",
 )
 
 
-def _bump_table_version():
-    st.session_state.table_version += 1
-
-
 if bulk_clicked:
-    with st.spinner("Migrating customers to their natural regions…"):
-        result = migrate_all_to_natural_regions()
-    st.session_state.last_action = (
-        f"Bulk migration complete: moved {len(result['moved'])} customers, "
-        f"skipped {result['skipped']} already-in-place."
-    )
-    _bump_table_version()
+    total, gen = iter_migrations_to_natural_regions()
+    _start_migration_job("Migrate to natural regions", total, gen)
     st.rerun()
 
 if reset_clicked:
-    with st.spinner("Resetting all customers to US zone…"):
-        result = reset_all_to_us()
-    st.session_state.last_action = f"Reset complete: moved {result['count']} customers back to US."
-    _bump_table_version()
+    total, gen = iter_reset_to_us()
+    _start_migration_job("Reset all to US", total, gen)
     st.rerun()
 
 
@@ -120,7 +170,7 @@ def render_live_cluster():
         st.markdown(
             f"<div style='border-left:4px solid {info['color']};"
             f"padding:0.4em 0.6em;margin:0.3em 0;'>"
-            f"<b>{z}</b> · {info['city']} ({info['aws_region']})<br/>"
+            f"<b>{z}</b> · {info['city']}<br/>"
             f"<span style='font-size:0.95em'>{n_cust} customers · {n_ord:,} orders</span>"
             f"</div>",
             unsafe_allow_html=True,
@@ -138,7 +188,8 @@ def _zone_shard_label(shard_name: str, zone_map: dict) -> str:
     """Return e.g. 'atlas-xu2oze-shard-1 (APAC zone · ap-southeast-1)'."""
     for zone, sname in zone_map.items():
         if sname == shard_name:
-            return f"{shard_name} ({zone} zone · {ZONE_REGION_INFO[zone]['aws_region']})"
+            info = ZONE_REGION_INFO[zone]
+            return f"{shard_name} ({zone} zone · {info['city']})"
     return shard_name
 
 
@@ -228,6 +279,70 @@ if st.session_state.last_action:
 
 
 # ---------------------------------------------------------------------------
+# Live migration feed — visible only while a job is queued, running, or
+# pending dismissal. Refreshes on its own 1-second timer; the rest of the
+# main pane (map, table, sidebar counters) stays interactive throughout.
+# ---------------------------------------------------------------------------
+def _format_completion_row(r: dict) -> str:
+    src = r.get("source_code") or r.get("source_zone", "?")
+    tgt = r.get("target_code") or r.get("target_zone", "?")
+    src_z = r.get("source_zone", "?")
+    tgt_z = r.get("target_zone", "?")
+    elapsed_s = (r.get("elapsed_ms") or 0) / 1000.0
+    n_orders = r.get("orders_updated", 0)
+    glyph = "•" if r.get("noop") else "✓"
+    return (
+        f"{glyph} `{r['customer_id']}` · "
+        f"`{src}`→`{tgt}` ({src_z} → {tgt_z}) · "
+        f"{n_orders} orders · {elapsed_s:.1f}s"
+    )
+
+
+@st.fragment(run_every=1)
+def render_migration_feed():
+    job = get_active_job()
+    if not job:
+        return
+
+    status = job.get("status", "running")
+    n_done = len(job.get("completed", []))
+    total = max(job.get("total", 0), 1)
+    elapsed = (job.get("ended_at") or time.time()) - job["started_at"]
+
+    if status == "running":
+        st.subheader(f"⏳ {job['label']} — running")
+        st.progress(
+            min(n_done / total, 1.0),
+            text=f"{n_done} / {total} customers · {elapsed:.1f}s elapsed",
+        )
+    elif status == "error":
+        st.subheader(f"❌ {job['label']} — failed")
+        st.error(f"Worker thread raised: {job.get('error')}")
+    else:  # done
+        st.subheader(f"✅ {job['label']} — complete")
+        total_orders = sum(r.get("orders_updated", 0) for r in job["completed"])
+        st.success(
+            f"Migrated {n_done} customer(s) and {total_orders:,} order(s) "
+            f"in {elapsed:.1f}s."
+        )
+
+    rows = list(reversed(job.get("completed", [])))
+    if rows:
+        with st.container(height=260, border=True):
+            for r in rows[:60]:
+                st.markdown(_format_completion_row(r))
+
+    if status in ("done", "error"):
+        if st.button("Dismiss", key=f"dismiss_job_{job['started_at']}"):
+            clear_active_job()
+            _bump_table_version()
+            st.rerun()
+
+
+render_migration_feed()
+
+
+# ---------------------------------------------------------------------------
 # Main pane — Map
 # ---------------------------------------------------------------------------
 st.subheader("Customers and data residency on the world map")
@@ -312,7 +427,7 @@ def build_map(customers: list[dict]) -> go.Figure:
             textfont=dict(size=12, color="black"),
             hoverinfo="text",
             hovertext=[
-                f"<b>{z} data centre</b><br>{info['city']} ({info['aws_region']})<br>"
+                f"<b>{z} data centre</b><br>{info['city']} · {info['cloud_provider']} {info['cloud_region']}<br>"
                 f"{n} customers · {sum(1 for _ in customers):,} total tenants"
             ],
             name=f"{z} data centre",
@@ -328,7 +443,20 @@ def build_map(customers: list[dict]) -> go.Figure:
     return fig
 
 
-st.plotly_chart(build_map(all_customers), use_container_width=True)
+# The map auto-refreshes every 3s so customer dots transition between zones
+# in roughly-real time during a background migration (and the post-completion
+# state appears without needing a full page rerun). The fragment re-fetches
+# customer data on every tick — that's 100 small docs and a Plotly redraw,
+# negligible cost relative to the migration work itself.
+@st.fragment(run_every=3)
+def render_map():
+    customers = list_customers()
+    if not customers:
+        return
+    st.plotly_chart(build_map(customers), use_container_width=True)
+
+
+render_map()
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +529,7 @@ with submit_col:
     submit_clicked = st.button(
         f"Submit migrations ({len(changes)})",
         type="primary",
-        disabled=len(changes) == 0,
+        disabled=len(changes) == 0 or _migration_in_flight(),
         use_container_width=True,
     )
 with info_col:
@@ -415,18 +543,10 @@ with info_col:
         st.caption("No pending migrations. Edit the **Data zone** column to queue one.")
 
 if submit_clicked and changes:
-    progress = st.progress(0.0, text=f"Migrating 0 / {len(changes)} customers…")
-    results = []
-    for i, ch in enumerate(changes, start=1):
-        result = migrate_customer(ch["cust_id"], ch["to"])
-        results.append(result)
-        progress.progress(i / len(changes), text=f"Migrating {i} / {len(changes)} customers…")
-    progress.empty()
-    total_orders = sum(r["orders_updated"] for r in results)
-    total_ms = sum(r["elapsed_ms"] for r in results)
-    st.session_state.last_action = (
-        f"Migrated {len(results)} customer(s) and {total_orders} order(s) "
-        f"in {total_ms:,.0f} ms total."
+    targets = [(c["cust_id"], c["to"]) for c in changes]
+    _start_migration_job(
+        f"Table submit ({len(targets)} customer{'s' if len(targets) != 1 else ''})",
+        len(targets),
+        migrate_batch_iter(targets, use_country=False),
     )
-    _bump_table_version()
     st.rerun()

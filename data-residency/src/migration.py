@@ -24,7 +24,9 @@ Verification:
 """
 from __future__ import annotations
 
+import threading
 import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.db import DB_NAME, get_client, get_db
@@ -44,6 +46,39 @@ ORDERS_PARALLEL_WORKERS = 16
 # threads × 16 order threads = 64 in-flight updates; well within Atlas M30's
 # default connection pool of 500.
 CUSTOMERS_PARALLEL_WORKERS = 4
+
+
+# ---------------------------------------------------------------------------
+# Process-global migration-job registry.
+#
+# The Streamlit UI launches migrations on a background thread and renders a
+# live feed by polling this registry from a fragment. Because the registry
+# lives at module scope, it survives browser refreshes and is shared across
+# Streamlit sessions — a user can refresh the tab mid-migration and the new
+# session picks up the still-running job. (`st.session_state` is per-session
+# and so wasn't suitable for this.)
+#
+# Single-job design: only one migration may run at a time. The UI gates its
+# buttons on `get_active_job()` to enforce this.
+# ---------------------------------------------------------------------------
+_ACTIVE_JOB: dict | None = None
+_JOB_LOCK = threading.Lock()
+
+
+def set_active_job(job: dict) -> None:
+    global _ACTIVE_JOB
+    with _JOB_LOCK:
+        _ACTIVE_JOB = job
+
+
+def get_active_job() -> dict | None:
+    return _ACTIVE_JOB
+
+
+def clear_active_job() -> None:
+    global _ACTIVE_JOB
+    with _JOB_LOCK:
+        _ACTIVE_JOB = None
 
 
 def migrate_customer(cust_id: str, target_zone: str) -> dict:
@@ -218,22 +253,32 @@ def migrate_customer_to_country(cust_id: str, target_code: str) -> dict:
     }
 
 
-def _migrate_batch(targets: list[tuple[str, str]], use_country: bool = False) -> list[dict]:
-    """Run a list of migrations in parallel.
+def migrate_batch_iter(
+    targets: list[tuple[str, str]], use_country: bool = False
+) -> Iterator[dict]:
+    """Stream migration results as each customer finishes.
 
     targets are (cust_id, target) tuples. If use_country=True, target is
     treated as an ISO country code (passed to migrate_customer_to_country).
     Otherwise target is a zone name (passed to migrate_customer).
+
+    Yields each customer's result in completion order. The Streamlit UI
+    consumes this from a worker thread to keep the page interactive while
+    the migration runs.
     """
     if not targets:
-        return []
+        return
     fn = migrate_customer_to_country if use_country else migrate_customer
-    results: list[dict] = []
     with ThreadPoolExecutor(max_workers=CUSTOMERS_PARALLEL_WORKERS) as ex:
         futures = {ex.submit(fn, cid, tgt): (cid, tgt) for cid, tgt in targets}
         for fut in as_completed(futures):
-            results.append(fut.result())
-    return results
+            yield fut.result()
+
+
+def _migrate_batch(targets: list[tuple[str, str]], use_country: bool = False) -> list[dict]:
+    """Blocking variant: collect every result and return the list. Kept for
+    callers that don't need streaming."""
+    return list(migrate_batch_iter(targets, use_country=use_country))
 
 
 def migrate_all_to_natural_regions() -> dict:
@@ -261,6 +306,33 @@ def reset_all_to_us() -> dict:
     targets = [(c["_id"], "US") for c in customers]
     moved = _migrate_batch(targets, use_country=True)
     return {"moved": moved, "count": len(moved)}
+
+
+def iter_migrations_to_natural_regions() -> tuple[int, Iterator[dict]]:
+    """Streaming variant of `migrate_all_to_natural_regions`. Returns the
+    pre-counted total of customers that need a migration plus a generator
+    that yields each result as the worker pool completes it.
+
+    The total is computed up-front so the UI can render an "X of N" progress
+    bar before the first result arrives.
+    """
+    db = get_db()
+    customers = list(db.customers.find({}, {"_id": 1, "country": 1, "location": 1}))
+    targets: list[tuple[str, str]] = []
+    for c in customers:
+        natural_country = c.get("country", "")
+        if c["location"] == natural_country:
+            continue
+        targets.append((c["_id"], natural_country))
+    return len(targets), migrate_batch_iter(targets, use_country=True)
+
+
+def iter_reset_to_us() -> tuple[int, Iterator[dict]]:
+    """Streaming variant of `reset_all_to_us`. Returns (total, generator)."""
+    db = get_db()
+    customers = list(db.customers.find({"location": {"$ne": "US"}}, {"_id": 1}))
+    targets = [(c["_id"], "US") for c in customers]
+    return len(targets), migrate_batch_iter(targets, use_country=True)
 
 
 def migration_status(cust_id: str) -> dict:

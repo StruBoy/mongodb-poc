@@ -45,21 +45,24 @@ def representative_code_for_zone(zone: str) -> str:
 ZONE_REGION_INFO = {
     "US": {
         "city": "Virginia",
-        "aws_region": "us-east-1",
+        "cloud_provider": "AWS",
+        "cloud_region": "us-east-1",
         "lat": 37.5407,
         "lon": -77.4360,
         "color": "#1f77b4",  # blue
     },
     "EU": {
         "city": "Frankfurt",
-        "aws_region": "eu-central-1",
+        "cloud_provider": "Azure",
+        "cloud_region": "germanywestcentral",
         "lat": 50.1109,
         "lon": 8.6821,
         "color": "#2ca02c",  # green
     },
     "APAC": {
         "city": "Singapore",
-        "aws_region": "ap-southeast-1",
+        "cloud_provider": "GCP",
+        "cloud_region": "asia-southeast1",
         "lat": 1.3521,
         "lon": 103.8198,
         "color": "#ff7f0e",  # orange

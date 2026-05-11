@@ -22,7 +22,12 @@ load_dotenv()
 
 DB_NAME = "residency_demo"
 COLLECTIONS = ["customers", "orders"]
-EXPECTED_REGIONS = {"us-east-1", "eu-central-1", "ap-southeast-1"}
+# One region tag we expect to see somewhere in the listShards host strings
+# per zone. Multi-cloud: US shard on AWS, EU on Azure, APAC on GCP. Atlas
+# hostnames sometimes embed the region tag (e.g. `*.gcp.mongodb.net`,
+# `*.azure.mongodb.net`); this check is best-effort and warns rather than
+# fails if the tag isn't present.
+EXPECTED_REGIONS = {"us-east-1", "germanywestcentral", "asia-southeast1"}
 
 
 def check_env_vars():
