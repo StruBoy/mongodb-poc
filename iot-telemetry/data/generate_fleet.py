@@ -22,7 +22,8 @@ geographically distinct zone:
     East    — Bedok, Tampines, Pasir Ris, Changi, Hougang, Sengkang, Punggol
 
 Tower IDs stay district-prefixed (TWR-CEN-####, TWR-EST-####, TWR-WST-####)
-and counts stay 350 / 300 / 350 to match scripts/verify_data.py.
+and counts are 333 / 333 / 334 (West / East / Central) to match
+scripts/verify_data.py.
 
 Run from the project root (iot-telemetry/):
     python -m data.generate_fleet
@@ -76,7 +77,7 @@ DISTRICTS = {
         # Tuas SW → up west coast → across north to Sembawang → south down the
         # W↔C partition line to Pasir Panjang → west along south coast → back.
         "polygon": _ring([0, 1, 2, 3, 4, 5, 6, 19, 20, 21]),
-        "count": 350,
+        "count": 333,
         "small_cell_ratio": 0.25,
     },
     "Central": {
@@ -85,7 +86,7 @@ DISTRICTS = {
         # C↔E partition to East Coast Park → west along south coast to Pasir
         # Panjang → north up W↔C partition back to Sembawang.
         "polygon": _ring([6, 7, 8, 15, 16, 17, 18, 19]),
-        "count": 350,
+        "count": 334,
         "small_cell_ratio": 0.45,    # CBD has the most small cells
     },
     "East": {
@@ -93,7 +94,7 @@ DISTRICTS = {
         # Sengkang North → east through Punggol/Pasir Ris/Changi → south to
         # East Coast Park → north up C↔E partition back to Sengkang.
         "polygon": _ring([8, 9, 10, 11, 12, 13, 14, 15]),
-        "count": 300,
+        "count": 333,
         "small_cell_ratio": 0.20,
     },
 }

@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from src.db import get_client, get_db
 
 EXPECTED_FLEET_COUNT = 1000
-EXPECTED_DISTRICTS = {"Central": 350, "East": 300, "West": 350}
+EXPECTED_DISTRICTS = {"Central": 334, "East": 333, "West": 333}
 EXPECTED_DISTRICT_PREFIXES = {"Central": "TWR-CEN-", "East": "TWR-EST-", "West": "TWR-WST-"}
 EXPECTED_TOWER_TYPES = {"macro", "small_cell"}
 TOWER_REQUIRED_FIELDS = {
