@@ -1,6 +1,6 @@
 # MongoDB APAC PoC playbook
 
-Six customer-segment proofs-of-concept built on MongoDB Atlas. Each one demonstrates that a single Atlas cluster can replace a multi-system stack (operational DB + search + vector + warehouse). The detailed playbooks live under [`plans/`](./plans).
+Seven customer-segment proofs-of-concept built on MongoDB Atlas. Each one demonstrates that a single Atlas cluster can replace a multi-system stack (operational DB + search + vector + warehouse). The detailed playbooks live under [`plans/`](./plans).
 
 | # | PoC | Status | Demonstrates |
 |---|---|---|---|
@@ -10,6 +10,7 @@ Six customer-segment proofs-of-concept built on MongoDB Atlas. Each one demonstr
 | 4 | [Citizen Case Mgmt](./plans/04_GovTech_Case_Management.md) (GovTech) | **Implemented** in [`govtech-casemgmt/`](./govtech-casemgmt) | Polymorphic docs + field-level encryption |
 | 5 | [IoT Telemetry](./plans/05_Telco_IoT_Telemetry.md) (Telco) | **Implemented** in [`iot-telemetry/`](./iot-telemetry) | Time-series collections + real-time aggregations |
 | 6 | EMR RAG (Healthcare) | **Implemented** in [`emr-rag/`](./emr-rag) | RAG over patient records + polymorphic visit schemas + PHI encryption |
+| 7 | Global Data Residency (Multi-region SaaS) | **Implemented** in [`data-residency/`](./data-residency) | Atlas Global Cluster + zone sharding — move tenant data between regions on a field update |
 
 ## Prerequisites
 
@@ -22,6 +23,7 @@ Six customer-segment proofs-of-concept built on MongoDB Atlas. Each one demonstr
 - IoT telemetry PoC (5) needs neither Voyage nor Anthropic — pure time-series + aggregations
 - GovTech case management PoC (4) needs neither Voyage nor Anthropic either — it uses application-side AES-256-GCM for field-level encryption (an extra `ENCRYPTION_KEY` env var, generated locally)
 - EMR RAG PoC (6) needs Voyage + Anthropic + an `ENCRYPTION_KEY` (PHI fields use the same AES-256-GCM pattern as PoC 4)
+- Data Residency PoC (7) needs **Atlas Global Cluster** (M30+, three zones US / EU / APAC mapped to AWS us-east-1 / eu-central-1 / ap-southeast-1) — significantly more expensive than the M10s above (~USD 24/day while running). **Pause between sessions.** No Voyage / Anthropic / encryption keys required.
 
 Each PoC lives in its own directory with its own venv, `.env`, and Atlas project. They can be deployed independently.
 
@@ -660,12 +662,146 @@ Architectural points to land:
 - PHI fields are application-side AES-256-GCM here for clarity; in production, MongoDB Queryable Encryption pushes the same pattern into the database itself.
 - The clinical narrative — OSA unifying treatment-resistant anxiety, metformin-resistant prediabetes, and nocturnal arrhythmia — is well-documented in the literature ("Syndrome Z"), so the prognosis shift the audience watches is grounded in real clinical reasoning.
 
+## Deploy the Data Residency PoC
+
+Total spin-up time: ~25 min including the Atlas Global Cluster provisioning (~15 min for the cluster itself), plus ~30 sec for data generation. **This is the most expensive PoC — M30 Global Cluster across three regions runs ~USD 24/day while active. Pause it the moment your session ends.**
+
+### 1. Provision the Atlas Global Cluster
+
+Atlas Global Clusters are not configurable from application code; the topology and sharding are set up by an **Atlas Project Owner** (or Org Owner) via the Atlas UI. Atlas restricts `shardCollection`, `splitChunk`, `enableSharding`, and `moveChunk` to its privileged service account — no database-user role (including `atlasAdmin`) can grant these to an application connection.
+
+1. Create project `poc-data-residency`
+2. Build Cluster → **Global Cluster** template
+   - **M30** minimum (Global Clusters require M30+; lower tiers are not offered for this template)
+   - MongoDB version 8.x
+   - Add three Zones:
+     - Zone `US`   → AWS `us-east-1` (Virginia)
+     - Zone `EU`   → AWS `eu-central-1` (Frankfurt)
+     - Zone `APAC` → AWS `ap-southeast-1` (Singapore)
+   - Each zone gets its own M30 replica set, becoming a shard tagged for that zone.
+3. **Database Access** → add user `pocuser` with **both** `readWriteAnyDatabase` AND `clusterMonitor` roles. The `clusterMonitor` role is needed for `listShards`, `config.chunks` reads, and `$collStats` per-shard reads.
+4. **Network Access** → add your current IP (or `0.0.0.0/0` for the demo only — revoke after).
+5. **Connect → Drivers** → copy the SRV connection string. Note: this is a single string; the driver routes reads/writes to the correct zone shard transparently.
+
+### 2. Create the database, then shard the collections via Atlas UI
+
+The application user can create empty collections but cannot shard them on a Global Cluster — that's an Atlas-administered operation. Order:
+
+1. Create the empty database + collections via the Python helper (this just calls `db.createCollection` against the cluster, which `readWriteAnyDatabase` covers):
+   ```bash
+   cd data-residency
+   python3 -m venv venv
+   source venv/bin/activate
+   pip install -r requirements.txt
+   cp .env.example .env
+   # set MONGODB_URI in .env
+   python -c "from src.db import get_db; db = get_db(); [db.create_collection(c) for c in ('customers', 'orders') if c not in db.list_collection_names()]; print(db.list_collection_names())"
+   ```
+2. In Atlas UI → Data Explorer → `residency_demo` → `customers` collection → **Global Writes tab** → **Shard Collection**:
+   - Second shard key field: `_id`
+   - (Optional) Tick **Pre-split data for even distribution** if shown — gives more visible chunk count in `sh.status()` without needing `splitChunk` privilege.
+   - Atlas will prompt for the zone code mapping the first time you shard a collection in this database. **Location codes must be valid ISO 3166-1 alpha-2 country codes** — Atlas silently buckets unknown codes into a default zone, which collapses two of your shards into one. Use these three representative codes:
+     - `US` → US zone (us-east-1)
+     - `DE` → EU zone (eu-central-1)
+     - `SG` → APAC zone (ap-southeast-1)
+3. Repeat step 2 for the `orders` collection with second shard key field `customer_id`. The zone-code mapping defined in step 2 is shared across all collections sharded with Global Writes in this database; you don't enter it again.
+
+The three location codes (`US`, `DE`, `SG`) are hard-coded in `src/zones.py:LOCATION_CODE_FOR_ZONE` and must match Atlas's configured codes character-for-character. The application UI continues to display the zones as `US` / `EU` / `APAC` for clarity; the translation between zone names (UI vocabulary) and ISO country codes (on-disk storage) happens in `src/zones.py`.
+
+### 3. Verify connectivity and sharding
+
+```bash
+python -m scripts.check_env
+```
+
+Five checks: env vars, MongoDB ping, sharded-cluster topology (mongos visible + `listShards` returns 3 shards), zone regions detected in shard hostnames (warns rather than fails if Atlas hostnames don't tag the region), and database / collection reachability.
+
+```bash
+python -m scripts.create_db_index
+```
+
+**Read-only verification** (despite the name — kept for symmetry with the other PoCs). Confirms both collections are sharded with the correct keys (`{location, _id}` and `{location, customer_id}`) and prints the per-shard chunk distribution. If any check fails, the script tells you exactly which Atlas UI step to run.
+
+### 4. Generate the dataset
+
+```bash
+python -m data.generate
+```
+
+Inserts 100 customer tenants spread across ~35 cities in 30+ countries, plus ~50–100 orders each (~7,500 orders total). **Every document starts in the US zone** regardless of the customer's business country — that's the demo's starting state. Takes ~30 seconds.
+
+### 5. Verify the data loaded correctly
+
+```bash
+python -m scripts.verify_data
+```
+
+Eight checks: customer count (100), order count (5,000–10,000), all country codes recognised, all customers initially in US zone, every order's `location` matches its parent customer's `location`, no orphan orders, country diversity per natural region (≥5 distinct countries each), sharded chunks span all 3 expected shards. Exits non-zero on any structural failure.
+
+### 6. Smoke-test the migration mechanism end-to-end
+
+```bash
+python -m scripts.smoke_test
+```
+
+Eight steps that prove zone migration works:
+1. Pick an APAC-domiciled customer, confirm their initial location is US.
+2. Call `migrate_customer(cust_id, "APAC")`.
+3. Assert customer + every order now reports `location: APAC`.
+4. Run `physical_shard_for_customer` (uses `explain.executionStats`) to confirm the docs physically live on the APAC shard.
+5. Print cluster-wide per-shard distribution.
+6. Migrate the customer back to US.
+7. Run `migrate_all_to_natural_regions` — assert every zone is populated and each customer is in the zone matching their country.
+8. Run `reset_all_to_us` — assert all 100 customers + all 7,500 orders are back in the US zone.
+
+All 8 steps should pass on a fresh seed.
+
+### 7. Launch the demo UI
+
+```bash
+streamlit run app.py
+```
+
+At `http://localhost:8501`:
+
+- **Sidebar**
+  - **Demo controls**: 🌍 Migrate to natural regions / ↺ Reset all to US
+  - **Live cluster**: per-zone customer + order counters with city / region / colour, refreshes every 3s
+  - **Inspect**: customer dropdown — pick any customer to see which physical shard their docs live on (via `explain` per collection)
+  - **Cluster overview** (expander): per-shard document counts cluster-wide and the `listShards` output
+- **Main pane**
+  - **World map**: 100 business-location dots coloured by current data zone, three big data-centre dots in Virginia / Frankfurt / Singapore sized by tenant count, and faint connection lines from each customer to their data-centre
+  - **Customer roster** (`st.data_editor`): edit any row's **Data zone** column to one of US / EU / APAC, then click **Submit migrations** to issue the changes. The submit button is gated on having a non-empty diff.
+
+### Demo flow
+
+The story: one logical Atlas cluster, three physical regions, one query path. Residency policy is a *data-model* concern — a `location` field on a shard key — not a routing-layer concern.
+
+1. **Frame the residency problem (1 min).** "Every global SaaS hits the same wall: a customer's compliance team says their data has to live in their region. The off-MongoDB answer is one cluster per region and a routing layer in your application. That's a fork in your data architecture every time a regulator changes a rule."
+2. **Show the architecture (1 min).** "This is one logical Atlas Global Cluster. Three physical regions: Virginia, Frankfurt, Singapore. The customers and orders collections are sharded — the shard key starts with a `location` field, and the zone definitions tie each value to one of those regions. The application connects to one URI; the driver handles the rest."
+3. **Steady state (30 sec).** Sidebar shows 100 customers in US shard, EU and APAC empty. Map shows business locations all over the world but every line points to Virginia. The data was inserted in one region, regardless of where the customer actually operates.
+4. **Bulk migrate (1.5 min).** Click **🌍 Migrate to natural regions**. The sidebar counters fan out — US drops, EU and APAC fill in. The map redraws with each customer's data line flipping to their natural data-centre. Open the Inspect panel on one APAC-domiciled customer to show the explain output reports their docs now live on `ap-southeast-1`-tagged shard.
+5. **Per-customer override (1.5 min).** "An APAC bank says: actually, our group treasury is in Frankfurt, we want our data in EU instead." Edit a row in the customer table, change Data zone from `APAC` to `EU`, click Submit. The progress bar shows the migration completing in ~1 second. The map line redraws. The inspector now reports the customer doc and orders on `eu-central-1`-tagged shard.
+6. **Reset (30 sec).** Click **↺ Reset all to US**. Every line redraws back to Virginia as 100 customers' data migrates home. The takeaway: residency is a property of *data*, not of *infrastructure*.
+7. **Land the architectural points (30 sec).** "One cluster, one query language, one connection string. Residency is a `location` field. Customers can change their declared region and your application is unchanged. This is what 'cloud-native data residency' should mean."
+
+Architectural points to land:
+- One logical Atlas Global Cluster spans all three regions; the application connects to a single URI and never cares which shard a doc lives on.
+- The shard key starts with the `location` field, and Atlas's zone tag ranges constrain `location: "US"` chunks to the US shard, etc.
+- Updating a shard-key value (`location` from "US" to "EU") is a normal write in MongoDB 5.0+; the mongos handles cross-shard atomicity via an internal distributed transaction. The doc physically moves between shards as part of the update.
+- The Inspector panel uses `explain.executionStats` to report which shard returned each document — proves the data physically moved, not just that a string field changed.
+
+Trade-offs worth flagging if asked:
+- Atlas Global Clusters require M30+ and are notably more expensive than the M10s elsewhere in this playbook. For a sustained pilot, expect ~USD 720/month per cluster.
+- Migration of a single customer's docs (1 customer + ~75 orders) returns in ~1 second — the demo's "watch it move" beat is brief by design. Bulk migration of all 100 customers takes ~30 seconds; that beat is more visible.
+- This PoC uses Atlas Global Writes (Atlas-managed zone configuration). The same pattern can be implemented with self-managed `sh.addShardToZone` + `sh.updateZoneKeyRange` against a manually-provisioned sharded cluster, but Atlas's Global Cluster template re-applies its own zone management, so fighting it gets messy.
+
 ## Project layout
 
 ```
 mongodb_poc/
 ├── README.md              ← this file
-├── plans/                 ← playbook docs for all five PoCs
+├── plans/                 ← playbook docs for PoCs 1–5 (PoCs 6 + 7 documented inline above)
 ├── fraud-detect/          ← implemented PoC #1
 │   ├── app.py             ← Streamlit dashboard
 │   ├── requirements.txt
@@ -701,13 +837,20 @@ mongodb_poc/
 │   ├── src/               ← db (sync + async), analytics
 │   ├── scripts/           ← check_env, create_db_index, verify_data, smoke_test
 │   └── data/              ← generate_fleet.py, stream_telemetry.py
-└── emr-rag/               ← implemented PoC #6
-    ├── app.py             ← Streamlit (GP / Patient persona toggle, summary, timeline, chat)
+├── emr-rag/               ← implemented PoC #6
+│   ├── app.py             ← Streamlit (GP / Patient persona toggle, summary, timeline, chat)
+│   ├── requirements.txt
+│   ├── .env.example
+│   ├── src/               ← db, embed, crypto (AES-256-GCM), patients, visits (auto-embed), rag (persona-aware)
+│   ├── scripts/           ← check_env, create_db_index, verify_data, smoke_test
+│   └── data/              ← generate.py (seed via Claude), followup_visits.py (canned demo batch)
+└── data-residency/        ← implemented PoC #7
+    ├── app.py             ← Streamlit (world map + data_editor table + shard inspector)
     ├── requirements.txt
     ├── .env.example
-    ├── src/               ← db, embed, crypto (AES-256-GCM), patients, visits (auto-embed), rag (persona-aware)
-    ├── scripts/           ← check_env, create_db_index, verify_data, smoke_test
-    └── data/              ← generate.py (seed via Claude), followup_visits.py (canned demo batch)
+    ├── src/               ← db, zones (country→zone map + region info), customers, orders, migration
+    ├── scripts/           ← check_env, create_db_index (shard + pre-split per customer), verify_data, smoke_test
+    └── data/              ← generate.py (100 customers + ~7,500 orders, all in US zone)
 ```
 
 ## Cleanup
@@ -719,4 +862,4 @@ After the demo:
 3. Remove `0.0.0.0/0` from Network Access if you opened it
 4. (Optional) `deactivate` and `rm -rf <poc-dir>/venv`
 
-Running an M10 idle costs ~USD 60/month — pause it if you're not actively demoing.
+Running an M10 idle costs ~USD 60/month — pause it if you're not actively demoing. The PoC #7 Global Cluster is **~USD 720/month idle** and the most important to pause.
